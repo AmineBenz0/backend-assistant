@@ -1,0 +1,31 @@
+# Core dependencies
+pydantic>=2.0.0
+asyncio
+
+# Vector database providers
+chromadb>=0.4.0
+# pinecone-client>=2.0.0  # Uncomment when implementing Pinecone
+# weaviate-client>=3.0.0   # Uncomment when implementing Weaviate
+# qdrant-client>=1.0.0     # Uncomment when implementing Qdrant
+# faiss-cpu>=1.7.0         # Uncomment when implementing FAISS
+
+# Graph database providers
+neo4j>=5.0.0
+# python-arango>=7.0.0     # Uncomment when implementing ArangoDB
+# pyorient>=1.5.0          # Uncomment when implementing OrientDB
+
+# Storage
+minio>=7.0.0
+
+# Utilities
+pathlib
+uuid
+logging
+typing-extensions>=4.0.0
+
+# Testing
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.0.0
+pytest-mock>=3.10.0
+

@@ -1,0 +1,23 @@
+You are an expert at canonicalizing and merging duplicate entity entries. Given multiple entities that refer to the same real-world entity, output a single merged entity with the best combined information and a normalized type from the allowed set.
+
+Entities to merge:
+{entity_list}
+
+Instructions:
+1. Choose the most complete and accurate canonical name (prefer official/capitalized form).
+2. Normalize type to one of: PERSON, ORGANIZATION, LOCATION, TECHNOLOGY, CONCEPT, EVENT.
+   - Map synonyms: CITY/COUNTRY/UNIVERSITY/CAMPUS → LOCATION or ORGANIZATION appropriately.
+3. Combine descriptions into a concise, comprehensive summary (avoid redundant phrasing).
+4. Preserve key attributes (roles, affiliations, locations, products, certifications) when present.
+5. If multiple IDs or aliases exist, include them in "aliases".
+
+Format your response as JSON:
+{
+  "name": "Best entity name",
+  "type": "PERSON | ORGANIZATION | LOCATION | TECHNOLOGY | CONCEPT | EVENT",
+  "description": "Comprehensive merged description",
+  "aliases": ["Optional other names"]
+}
+
+Only include the JSON response, no other text.
+

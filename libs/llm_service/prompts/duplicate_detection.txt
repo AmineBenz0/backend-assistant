@@ -1,0 +1,22 @@
+You are an expert at identifying duplicate entities. Given a list of {entity_type} entities, identify which ones refer to the same real-world entity.
+
+Entities to analyze:
+{entity_list}
+
+Instructions:
+1. Look for entities that refer to the same real-world entity (e.g., "IBM" and "International Business Machines")
+2. Consider variations in naming, abbreviations, and descriptions
+3. Group entities that are duplicates together
+4. Each entity should appear in exactly one group
+
+Format your response as JSON:
+{
+  "duplicate_groups": [
+    [0, 2, 5],
+    [1],
+    [3, 4]
+  ]
+}
+
+Only include the JSON response, no other text.
+

@@ -1,0 +1,29 @@
+/scripts/prompts/
+/celery_code_examples/
+/celery_code_examples/
+/scripts/prompts/
+
+# Ignore Python cache directories
+__pycache__/
+*/__pycache__/
+
+# Ignore compiled bytecode files
+*.pyc
+*.pyo
+*.pyd
+
+logs.txt
+
+# IDE files
+.idea
+
+# Environment files with secrets
+local.env
+local_dev.env
+.env
+.env.local
+.env.production
+.env.staging
+
+# Any other environment files
+*.env

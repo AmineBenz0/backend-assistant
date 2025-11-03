@@ -1,0 +1,56 @@
+database:
+  neo4j:
+    uri: "bolt://localhost:7687"
+    username: "neo4j"
+    password: "password"
+  chromadb:
+    host: "localhost"
+    port: 8001
+  minio:
+    endpoint: "localhost:9000"
+    access_key: "minioadmin"
+    secret_key: "minioadmin"
+
+pipeline:
+  chunk_size: 1000
+  chunk_overlap: 200
+  max_workers: 4
+
+models:
+  llm:
+    provider: "openai"
+    model: "gpt-4"
+  embeddings:
+    provider: "openai"
+    model: "text-embedding-ada-002"
+
+llm_service:
+  provider: "openai"
+  model: "gpt-4"
+  api_key: "your-api-key-here"
+  temperature: 0.7
+  max_tokens: 2000
+
+embeddings:
+  provider: "openai"
+  model: "text-embedding-ada-002"
+  api_key: "your-api-key-here"
+  dimensions: 1536
+
+graph_builder:
+  max_entities_per_chunk: 50
+  relationship_threshold: 0.7
+  entity_extraction_model: "gpt-4"
+  relationship_extraction_model: "gpt-4"
+
+preprocessing:
+  chunk_size: 1000
+  chunk_overlap: 200
+  supported_formats: ["pdf", "txt", "docx", "md"]
+  max_file_size_mb: 100
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+environment: "test"

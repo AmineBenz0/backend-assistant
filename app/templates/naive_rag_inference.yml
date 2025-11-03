@@ -1,0 +1,79 @@
+defaults: &defaults
+  template_id: chat_inference
+  prompt_config_src: langfuse
+  database: default
+
+task: chat_inference
+<<: *defaults
+inputs:
+  - client_id
+  - project_id
+  - session_id
+  - input_text
+  - top_k
+  - limit
+
+steps:
+  - step: save_user_message
+    pipeline_key: save_user_message
+    inputs:
+      - input_text
+      - client_id
+      - project_id
+      - session_id
+    queue: io_queue
+  
+  - step: extract_user_facts
+    pipeline_key: extract_user_facts
+    inputs:
+      - input_text
+      - client_id
+      - project_id
+      - session_id
+    queue: io_queue
+  
+  - step: search_relevant_chunks
+    pipeline_key: search_relevant_chunks
+    inputs:
+      - input_text
+      - client_id
+      - project_id
+      - top_k
+    queue: io_queue
+  
+  - step: fetch_chat_history
+    pipeline_key: fetch_chat_history
+    inputs:
+      - client_id
+      - project_id
+      - session_id
+      - limit
+    queue: io_queue
+  
+  - step: fetch_user_facts
+    pipeline_key: fetch_user_facts
+    inputs:
+      - extract_user_facts
+      - client_id
+      - project_id
+      - session_id
+      - input_text
+    queue: io_queue
+  
+  - step: naive-rag-inference
+    pipeline_key: naive-rag-inference
+    inputs:
+      - input_text
+      - search_relevant_chunks
+      - fetch_chat_history
+      - fetch_user_facts
+    queue: io_queue
+  
+  - step: save_vector_llm_message
+    pipeline_key: save_vector_llm_message
+    inputs: 
+      - naive-rag-inference
+      - client_id
+      - project_id
+      - session_id
+    queue: io_queue
