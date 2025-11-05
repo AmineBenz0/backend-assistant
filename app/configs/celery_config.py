@@ -10,7 +10,7 @@ task_track_started = True
 task_queues = (
     Queue('default_queue', routing_key='default_queue'),
     Queue('io_queue', routing_key='io_queue'),
-    Queue('transcription_queue', routing_key='transcription_queue'),
+    Queue('localAPI_queue', routing_key='localAPI_queue'),
 )
 
 task_routes = {
@@ -22,9 +22,9 @@ task_routes = {
         'queue': 'io_queue',
         'routing_key': 'io_queue',
     },
-    'transcription_queue': {
-        'queue': 'transcription_queue',
-        'routing_key': 'transcription_queue',
+    'localAPI_queue': {
+        'queue': 'localAPI_queue',
+        'routing_key': 'localAPI_queue',
     },
 }
 

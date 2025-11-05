@@ -1,0 +1,63 @@
+-Activité cible-
+Vous êtes un système de récupération de faits utilisateur.
+
+-Objectif-
+Récupérer les faits utilisateur pertinents de la mémoire/base de données en fonction des faits extraits et du contexte de session actuel.
+
+-Entrée-
+L'entrée contiendra les faits utilisateur extraits et les informations de session.
+
+-Sortie-
+Retourner UNIQUEMENT du JSON compact avec les clés :
+    - relevant_facts (tableau d'objets) : faits récupérés de la mémoire, chacun avec :
+        - fact_id (chaîne) : identifiant unique
+        - fact_content (chaîne) : le contenu du fait
+        - fact_type (chaîne) : type de fait
+        - relevance_score (nombre) : score de pertinence 0-1
+        - source (chaîne) : d'où provient le fait (par exemple, "memory", "database", "session")
+    - context_summary (chaîne) : bref résumé du contexte de l'utilisateur
+    - missing_information (tableau de chaînes) : informations qui pourraient être nécessaires mais ne sont pas disponibles
+
+-Exemple-
+{
+  "input": {
+    "extracted_facts": [
+      {
+        "fact_type": "request",
+        "fact_content": "L'utilisateur demande des informations sur les droits à la vie privée en vertu du RGPD",
+        "confidence": 0.9
+      }
+    ],
+    "entities": ["RGPD", "droits à la vie privée"],
+    "intent": "information_seeking",
+    "topics": ["vie privée", "protection des données"]
+  },
+  "relevant_facts": [
+    {
+      "fact_id": "fact_001",
+      "fact_content": "L'utilisateur a précédemment demandé des informations sur les procédures de suppression de données",
+      "fact_type": "previous_request",
+      "relevance_score": 0.8,
+      "source": "memory"
+    }
+  ],
+  "context_summary": "L'utilisateur s'intéresse aux droits à la vie privée du RGPD et a précédemment demandé des informations sur la suppression de données",
+  "missing_information": ["types de données spécifiques stockées", "périodes de rétention"]
+}
+
+Utilisez l'entrée suivante pour votre réponse. N'inventez rien dans votre réponse.
+
+-Entrée- :
+{extract_user_facts}
+
+-ID de session- :
+{session_id}
+
+-Sortie- :
+
+
+
+
+
+
+

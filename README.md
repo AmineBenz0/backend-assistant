@@ -1,6 +1,6 @@
-# GraphRAG Backend Pipeline
+# VectorRAG Backend Pipeline
 
-A comprehensive GraphRAG (Graph Retrieval-Augmented Generation) pipeline that processes documents through a 12-step workflow to build knowledge graphs and store them in Neo4j.
+A comprehensive VectorRAG (Vector Retrieval-Augmented Generation) pipeline that processes documents and enables vector-based search and inference.
 
 ## 🚀 Quick Start
 
@@ -47,7 +47,6 @@ python3 scripts/setup_minio.py
 |---------|------|---------|-----|
 | **FastAPI App** | 8002 | Main API server | http://localhost:8002 |
 | **MinIO** | 9000/9001 | Object storage | http://localhost:9001 |
-| **Neo4j** | 7474/7687 | Graph database | http://localhost:7474 |
 | **ChromaDB** | 8001 | Vector database | http://localhost:8001 |
 | **Redis** | 6379 | Task queue | - |
 | **Celery** | - | Background tasks | - |
@@ -65,11 +64,6 @@ MINIO_ENDPOINT=localhost:9000
 MINIO_ACCESS_KEY=minioadmin
 MINIO_SECRET_KEY=minioadmin
 MINIO_SECURE=false
-
-# Neo4j Configuration
-NEO4J_URI=bolt://localhost:7687
-NEO4J_USER=neo4j
-NEO4J_PASSWORD=password
 
 # Azure OpenAI (for embeddings)
 AZURE_OPENAI_API_KEY=your_api_key
@@ -100,34 +94,38 @@ curl http://localhost:8002/health
 }
 ```
 
-### Process Documents (GraphRAG Pipeline)
+### Process Documents (Vector Preprocessing Pipeline)
 
-**Endpoint:** `POST /api/v1/pipeline/process`
+**Endpoint:** `POST /api/workflow/vector_preprocessing`
 
 **Request Body:**
 ```json
 {
-  "client_id": "testclient",
-  "project_id": "testproject",
-  "pipeline_config": {
-    "template_id": "graph_preprocessing",
-    "enable_embeddings": true,
-    "store_in_neo4j": true
+  "workflow_id": "preprocessing_001",
+  "input": {
+    "client_id": "testclient",
+    "project_id": "testproject",
+    "language": "en",
+    "embedding_model": "text-embedding-3-large",
+    "embedding_provider": "azure_openai",
+    "embedding_batch_size": 100
   }
 }
 ```
 
 **Example using curl:**
 ```bash
-curl -X POST "http://localhost:8002/api/v1/pipeline/process" \
+curl -X POST "http://localhost:8002/api/workflow/vector_preprocessing" \
   -H "Content-Type: application/json" \
   -d '{
-    "client_id": "testclient",
-    "project_id": "testproject",
-    "pipeline_config": {
-      "template_id": "graph_preprocessing",
-      "enable_embeddings": true,
-      "store_in_neo4j": true
+    "workflow_id": "preprocessing_001",
+    "input": {
+      "client_id": "testclient",
+      "project_id": "testproject",
+      "language": "en",
+      "embedding_model": "text-embedding-3-large",
+      "embedding_provider": "azure_openai",
+      "embedding_batch_size": 100
     }
   }'
 ```
@@ -135,168 +133,100 @@ curl -X POST "http://localhost:8002/api/v1/pipeline/process" \
 **Response:**
 ```json
 {
-  "job_id": "job_1736593800_abc123",
-  "status": "processing",
-  "message": "Pipeline started successfully",
-  "estimated_duration": "5-10 minutes",
-  "steps": [
-    "GetFiles",
-    "parse_documents", 
-    "create_base_text_units",
-    "create_base_extracted_entities",
-    "create_summarized_entities",
-    "create_base_entity_graph",
-    "create_final_entities",
-    "create_final_nodes",
-    "create_final_communities",
-    "create_final_relationships",
-    "create_final_text_units",
-    "create_final_community_reports",
-    "create_base_documents",
-    "create_final_documents",
-    "generate_entity_embeddings",
-    "create_vector_index",
-    "create_graph_index",
-    "store_vector_embeddings",
-    "store_graph_data"
+  "workflow_id": "preprocessing_001",
+  "tasks": [
+    {
+      "step_name": "GetFiles",
+      "pipeline_key": "GetFiles",
+      "task_id": "abc123...",
+      "queue": "localAPI_queue",
+      "status": "PENDING"
+    },
+    {
+      "step_name": "parse_documents",
+      "pipeline_key": "ParseDocuments",
+      "task_id": "def456...",
+      "queue": "localAPI_queue",
+      "status": "PENDING"
+    },
+    {
+      "step_name": "chunk_documents",
+      "pipeline_key": "chunk_documents",
+      "task_id": "ghi789...",
+      "queue": "localAPI_queue",
+      "status": "PENDING"
+    },
+    {
+      "step_name": "generate_embeddings",
+      "pipeline_key": "GenerateChunkEmbeddings",
+      "task_id": "jkl012...",
+      "queue": "localAPI_queue",
+      "status": "PENDING"
+    },
+    {
+      "step_name": "store_chunks_in_vector_db",
+      "pipeline_key": "StoreChunksInVectorDB",
+      "task_id": "mno345...",
+      "queue": "localAPI_queue",
+      "status": "PENDING"
+    },
+    {
+      "step_name": "save_mapping_to_document_db",
+      "pipeline_key": "save_mapping_to_document_db",
+      "task_id": "pqr678...",
+      "queue": "localAPI_queue",
+      "status": "PENDING"
+    }
   ]
 }
 ```
 
-### Check Job Status
+### Chat Workflow (Vector Inference Pipeline)
 
-**Endpoint:** `GET /api/v1/pipeline/status/{job_id}`
-
-```bash
-curl http://localhost:8002/api/v1/pipeline/status/job_1736593800_abc123
-```
-
-**Response:**
-```json
-{
-  "job_id": "job_1736593800_abc123",
-  "status": "completed",
-  "progress": {
-    "current_step": 19,
-    "total_steps": 19,
-    "percentage": 100
-  },
-  "results": {
-    "entities_created": 477,
-    "relationships_created": 113526,
-    "communities_detected": 45,
-    "processing_time": "8m 32s"
-  },
-  "neo4j_stats": {
-    "nodes_stored": 477,
-    "relationships_stored": 113526,
-    "indexes_created": 3
-  }
-}
-```
-
-### Query Knowledge Graph
-
-**Endpoint:** `POST /api/v1/graph/query`
+**Endpoint:** `POST /api/chat/vector_inference`
 
 **Request Body:**
 ```json
 {
-  "query": "MATCH (n:Entity) WHERE n.name CONTAINS 'technology' RETURN n LIMIT 10",
-  "parameters": {}
+  "workflow_id": "inference_001",
+  "input": {
+    "client_id": "testclient",
+    "project_id": "testproject",
+    "session_id": "session123",
+    "user_id": "user456",
+    "input_text": "What is the main topic?",
+    "top_k": 5,
+    "limit": 10,
+    "language": "en"
+  }
 }
 ```
 
-**Example:**
+**Example using curl:**
 ```bash
-curl -X POST "http://localhost:8002/api/v1/graph/query" \
+curl -X POST "http://localhost:8002/api/chat/vector_inference" \
   -H "Content-Type: application/json" \
   -d '{
-    "query": "MATCH (n:Entity)-[r:RELATES_TO]->(m:Entity) RETURN n.name, r.type, m.name LIMIT 5"
+    "workflow_id": "inference_001",
+    "input": {
+      "client_id": "testclient",
+      "project_id": "testproject",
+      "session_id": "session123",
+      "user_id": "user456",
+      "input_text": "What is the main topic?",
+      "top_k": 5,
+      "limit": 10,
+      "language": "en"
+    }
   }'
 ```
 
-**Response:**
-```json
-{
-  "results": [
-    {
-      "n.name": "Machine Learning",
-      "r.type": "RELATES_TO", 
-      "m.name": "Artificial Intelligence"
-    },
-    {
-      "n.name": "Data Science",
-      "r.type": "RELATES_TO",
-      "m.name": "Analytics"
-    }
-  ],
-  "count": 5,
-  "execution_time": "0.023s"
-}
-```
+### Check Job Status
 
-### Search Entities
-
-**Endpoint:** `GET /api/v1/entities/search`
-
-**Query Parameters:**
-- `q`: Search query
-- `limit`: Number of results (default: 10)
-- `type`: Entity type filter (optional)
+**Endpoint:** `GET /api/results/{task_id}`
 
 ```bash
-curl "http://localhost:8002/api/v1/entities/search?q=machine%20learning&limit=5"
-```
-
-**Response:**
-```json
-{
-  "entities": [
-    {
-      "id": "entity_123",
-      "name": "Machine Learning",
-      "type": "TECHNOLOGY",
-      "description": "A subset of artificial intelligence...",
-      "properties": {
-        "confidence": 0.95,
-        "mentions": 15
-      }
-    }
-  ],
-  "total": 1,
-  "query": "machine learning"
-}
-```
-
-### Get Entity Relationships
-
-**Endpoint:** `GET /api/v1/entities/{entity_id}/relationships`
-
-```bash
-curl http://localhost:8002/api/v1/entities/entity_123/relationships
-```
-
-**Response:**
-```json
-{
-  "entity": {
-    "id": "entity_123",
-    "name": "Machine Learning"
-  },
-  "relationships": [
-    {
-      "target_entity": {
-        "id": "entity_456", 
-        "name": "Artificial Intelligence"
-      },
-      "relationship_type": "IS_PART_OF",
-      "strength": 0.89,
-      "description": "Machine Learning is a subset of AI"
-    }
-  ],
-  "total": 15
-}
+curl http://localhost:8002/api/results/YOUR_TASK_ID
 ```
 
 ## 🧪 Testing the Pipeline
@@ -315,36 +245,26 @@ python setup_minio.py
 ### 2. Process the Document
 
 ```bash
-curl -X POST "http://localhost:8002/api/v1/pipeline/process" \
+curl -X POST "http://localhost:8002/api/workflow/vector_preprocessing" \
   -H "Content-Type: application/json" \
   -d '{
-    "client_id": "testclient",
-    "project_id": "testproject"
+    "workflow_id": "preprocessing_001",
+    "input": {
+      "client_id": "testclient",
+      "project_id": "testproject",
+      "language": "en"
+    }
   }'
 ```
 
 ### 3. Monitor Progress
 
 ```bash
-# Get job ID from previous response, then:
-curl http://localhost:8002/api/v1/pipeline/status/YOUR_JOB_ID
+# Get task ID from previous response, then:
+curl http://localhost:8002/api/results/YOUR_TASK_ID
 
 # Or check Celery Flower dashboard
 open http://localhost:5555
-```
-
-### 4. Query Results
-
-```bash
-# Search for entities
-curl "http://localhost:8002/api/v1/entities/search?q=your_search_term"
-
-# Query Neo4j directly
-curl -X POST "http://localhost:8002/api/v1/graph/query" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": "MATCH (n:Entity) RETURN count(n) as total_entities"
-  }'
 ```
 
 ## 🔍 Monitoring and Debugging
@@ -363,11 +283,6 @@ docker-compose -f docker-compose.local.yml logs minio
 
 ### Database Access
 
-**Neo4j Browser:**
-- URL: http://localhost:7474
-- Username: `neo4j`
-- Password: `password`
-
 **MinIO Console:**
 - URL: http://localhost:9001  
 - Username: `minioadmin`
@@ -385,9 +300,6 @@ curl http://localhost:8002/health
 # Check MinIO
 curl http://localhost:9000/minio/health/live
 
-# Check Neo4j
-curl -u neo4j:password http://localhost:7474/db/data/
-
 # Check ChromaDB
 curl http://localhost:8001/api/v1/heartbeat
 ```
@@ -398,7 +310,7 @@ curl http://localhost:8001/api/v1/heartbeat
 
 ```bash
 # Start only infrastructure services
-docker-compose -f docker-compose.local.yml up -d minio neo4j chromadb redis
+docker-compose -f docker-compose.local.yml up -d minio chromadb redis
 
 # Run FastAPI app locally
 cd app
@@ -428,24 +340,25 @@ class DocxParser:
 
 ## 📊 Pipeline Architecture
 
-The pipeline processes documents through these stages:
+The vector preprocessing pipeline processes documents through these stages:
 
 1. **Document Retrieval** (`GetFiles`) - Fetch from MinIO
 2. **Document Parsing** (`ParseDocuments`) - Extract text content  
-3. **Text Processing** (`create_base_text_units`) - Chunk into units
-4. **Entity Extraction** (`create_base_extracted_entities`) - LLM entity recognition
-5. **Entity Summarization** (`create_summarized_entities`) - Deduplicate entities
-6. **Graph Construction** (`create_base_entity_graph`) - Build entity graph
-7. **Entity Finalization** (`create_final_entities`) - Finalize entity data
-8. **Node Creation** (`create_final_nodes`) - Prepare graph nodes
-9. **Community Detection** (`create_final_communities`) - Find entity clusters
-10. **Relationship Building** (`create_final_relationships`) - Create entity connections
-11. **Text Unit Linking** (`create_final_text_units`) - Link text to entities
-12. **Community Reports** (`create_final_community_reports`) - Generate summaries
-13. **Document Processing** (`create_base_documents`, `create_final_documents`) - Process document metadata
-14. **Embedding Generation** (`generate_entity_embeddings`) - Create vector embeddings
-15. **Index Creation** (`create_vector_index`, `create_graph_index`) - Setup database indexes
-16. **Data Storage** (`store_vector_embeddings`, `store_graph_data`) - Persist to databases
+3. **Document Chunking** (`chunk_documents`) - Split documents into chunks
+4. **Embedding Generation** (`GenerateChunkEmbeddings`) - Create vector embeddings
+5. **Vector Storage** (`StoreChunksInVectorDB`) - Store chunks in ChromaDB
+6. **Document Mapping** (`save_mapping_to_document_db`) - Save metadata to Elasticsearch
+
+The vector inference pipeline handles queries through these stages:
+
+1. **User Message** (`save_user_message`) - Save user input
+2. **User Facts** (`fetch_user_facts`, `extract_user_facts`) - Extract user context
+3. **Vector Search** (`search_relevant_chunks`) - Find relevant chunks
+4. **Vector References** (`GetVectorReference`) - Get reference metadata
+5. **Chat History** (`fetch_chat_history`) - Retrieve conversation context
+6. **RAG Generation** (`run-vector-rag`) - Generate response using LLM
+7. **Response Combination** (`combine_vector_response_and_references`) - Combine results
+8. **Message Storage** (`save_vector_llm_message`) - Save LLM response
 
 ## 🚨 Troubleshooting
 
@@ -471,15 +384,6 @@ curl http://localhost:9000/minio/health/live
 cat local.env | grep MINIO
 ```
 
-**Neo4j connection errors:**
-```bash
-# Check Neo4j status
-docker-compose -f docker-compose.local.yml logs neo4j
-
-# Test connection
-curl -u neo4j:password http://localhost:7474/db/data/
-```
-
 **Pipeline processing errors:**
 ```bash
 # Check Celery worker logs
@@ -496,17 +400,12 @@ open http://localhost:5555
 - Adjust text chunking parameters
 - Use batch processing for embeddings
 
-**For better Neo4j performance:**
-- Increase Neo4j memory allocation
-- Create additional indexes
-- Use batch inserts for large graphs
-
 ## 📚 Additional Resources
 
-- [Neo4j Cypher Query Language](https://neo4j.com/docs/cypher-manual/current/)
 - [MinIO Python SDK](https://min.io/docs/minio/linux/developers/python/minio-py.html)
 - [FastAPI Documentation](https://fastapi.tiangolo.com/)
 - [Celery Documentation](https://docs.celeryproject.org/)
+- [ChromaDB Documentation](https://docs.trychroma.com/)
 
 ## 🤝 Contributing
 

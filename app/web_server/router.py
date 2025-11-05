@@ -1,11 +1,18 @@
-from fastapi import APIRouter, status, Path, Query, HTTPException
+from fastapi import APIRouter, status, Path, Query, HTTPException, Body
 from fastapi.responses import JSONResponse
+from fastapi import HTTPException
 import os
 import yaml
 from app.task_processing.celery_app import celery_app
 from celery.result import AsyncResult
 from app.task_processing.tasks_engine import generate_tasks_structure
-from app.utils.schemas import WorkflowRequest, ChatRequest, WorkflowResponse
+from app.utils.schemas import (
+    WorkflowRequest, 
+    ChatRequest, 
+    WorkflowResponse,
+    WORKFLOW_REQUEST_EXAMPLES,
+    CHAT_REQUEST_EXAMPLES
+)
 from libs.database_service.sql_db.providers import PgSQLProvider
 
 router = APIRouter()
@@ -32,13 +39,13 @@ def get_workflow_status(workflow_id: str):
 @router.post(
     "/api/workflow/{template}",
     summary="Start a workflow",
-    description="Start a new workflow using the specified template. The workflow will process documents through the graph preprocessing pipeline.",
+    description="Start a new workflow using the specified template. The workflow will process documents through the vector preprocessing pipeline.",
     response_description="Returns the workflow ID and task structure for monitoring progress",
     response_model=WorkflowResponse
 )
 def start_workflow(
-    request: WorkflowRequest,
-    template: str = Path(..., description="Template name (e.g., 'graph_preprocessing')")
+    template: str = Path(..., description="Template name (e.g., 'vector_preprocessing')"),
+    request: WorkflowRequest = Body(..., openapi_examples=WORKFLOW_REQUEST_EXAMPLES)
 ):
     try:
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -53,6 +60,16 @@ def start_workflow(
 
         # Assuming workflow_id is part of the input for now
         workflow_id = request.input.get("workflow_id", "default_workflow")
+
+        # Inject domain_id based on language if provided (expected values: "en", "it", or "fr")
+        language = (request.input.get("language") or "").strip().lower()
+        if language:
+            if language == "it":
+                request.input["domain_id"] = "it_dpac"
+            elif language == "en":
+                request.input["domain_id"] = "en_dpac"
+            elif language == "fr":
+                request.input["domain_id"] = "fr_dpac"
 
         # Generate tasks structure
         tasks_structure = generate_tasks_structure(
@@ -74,13 +91,13 @@ def start_workflow(
 @router.post(
     "/api/chat/{template}",
     summary="Start a chat workflow",
-    description="Start a new chat workflow using the specified template. The workflow will process user input through the graph inference pipeline.",
+    description="Start a new chat workflow using the specified template. The workflow will process user input through the vector inference pipeline.",
     response_description="Returns the workflow ID and task structure for monitoring progress",
     response_model=WorkflowResponse
 )
 def start_chat_workflow(
-    request: ChatRequest,
-    template: str = Path(..., description="Template name (e.g., 'graph_inference')")
+    template: str = Path(..., description="Template name (e.g., 'vector_inference')"),
+    request: ChatRequest = Body(..., openapi_examples=CHAT_REQUEST_EXAMPLES)
 ):
     try:
         print('################# /api/chat/{template} #################')
@@ -97,6 +114,16 @@ def start_chat_workflow(
 
         # Assuming workflow_id is part of the input for now
         workflow_id = request.input.get("workflow_id", "default_workflow")
+
+        # Inject domain_id based on language if provided (expected values: "en", "it", or "fr")
+        language = (request.input.get("language") or "").strip().lower()
+        if language:
+            if language == "it":
+                request.input["domain_id"] = "it_dpac"
+            elif language == "en":
+                request.input["domain_id"] = "en_dpac"
+            elif language == "fr":
+                request.input["domain_id"] = "fr_dpac"
 
         # Generate tasks structure
         tasks_structure = generate_tasks_structure(
@@ -137,7 +164,8 @@ def job_result(task_id: str):
 def get_chat_history(
     project_id: str = Query(..., description="Project ID to filter chat history"),
     session_id: str = Query(..., description="Session ID to filter chat history"),
-    client_id: str = Query(None, description="Optional client ID to filter chat history")
+    client_id: str = Query(None, description="Optional client ID to filter chat history"),
+    user_id: str = Query(None, description="Optional user ID to filter chat history")
 ):
     """
     Get all chat history for a specific session.
@@ -146,14 +174,12 @@ def get_chat_history(
         project_id: The project identifier
         session_id: The session identifier
         client_id: Optional client identifier (defaults to project_id if not provided)
+        user_id: Optional user identifier to filter messages for a specific user
     
     Returns:
         JSON response with all chat history messages and metadata
     """
     try:
-        # Use project_id as client_id if client_id is not provided
-        if not client_id:
-            client_id = project_id
             
         # Initialize database provider
         db = PgSQLProvider()
@@ -162,7 +188,8 @@ def get_chat_history(
         messages = db.get_messages(
             client_id=client_id,
             project_id=project_id,
-            session_id=session_id
+            session_id=session_id,
+            user_id=user_id
         )
         
         # Convert datetime objects to ISO format strings for JSON serialization
@@ -182,7 +209,8 @@ def get_chat_history(
                     "total_messages": len(serialized_messages),
                     "client_id": client_id,
                     "project_id": project_id,
-                    "session_id": session_id
+                    "session_id": session_id,
+                    "user_id": user_id
                 }
             }
         )
@@ -203,7 +231,8 @@ def get_chat_history(
                     "total_messages": 0,
                     "client_id": client_id,
                     "project_id": project_id,
-                    "session_id": session_id
+                    "session_id": session_id,
+                    "user_id": user_id
                 }
             }
         )

@@ -55,7 +55,6 @@ class WeaviateVectorProvider(BaseVectorProvider):
                 logger.info("No API key provided, using anonymous access")
             
             # Use asyncio to run the synchronous Weaviate operations in a thread pool
-            # This follows the same pattern as Neo4j provider
             import asyncio
             
             def _create_client():
@@ -106,7 +105,6 @@ class WeaviateVectorProvider(BaseVectorProvider):
                 print("🔍 [DEBUG] Weaviate connection test FAILED after all retries")
                 return False
             
-            # Run client creation in thread pool (following Neo4j pattern)
             print("🔍 [DEBUG] Running client creation in thread pool...")
             loop = asyncio.get_event_loop()
             self.client = await loop.run_in_executor(None, _create_client)

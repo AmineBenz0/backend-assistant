@@ -1,26 +1,41 @@
 defaults: &defaults
-  template_id: chat_inference
-  prompt_config_src: langfuse
+  template_id: vector_inference
+  prompt_config:
+    source: langfuse
+    organization_name: dxc
+    project_name: d.pac
   database: default
 
-task: chat_inference
+task: vector_inference
 <<: *defaults
 inputs:
   - client_id
   - project_id
   - session_id
+  - user_id
   - input_text
   - top_k
   - limit
+  - language
 
 steps:
   - step: save_user_message
     pipeline_key: save_user_message
     inputs:
+      - user_id
       - input_text
       - client_id
       - project_id
       - session_id
+    queue: io_queue
+    
+  - step: fetch_user_facts
+    pipeline_key: fetch_user_facts
+    inputs:
+      - client_id
+      - project_id
+      - session_id
+      - input_text
     queue: io_queue
   
   - step: extract_user_facts
@@ -38,42 +53,54 @@ steps:
       - input_text
       - client_id
       - project_id
+      - language
       - top_k
     queue: io_queue
   
+  - step: GetVectorReference
+    pipeline_key: GetVectorReference
+    inputs:
+      - client_id
+      - project_id
+      - language
+      - search_relevant_chunks
+    queue: io_queue
+
   - step: fetch_chat_history
     pipeline_key: fetch_chat_history
     inputs:
       - client_id
       - project_id
       - session_id
+      - user_id
       - limit
     queue: io_queue
   
-  - step: fetch_user_facts
-    pipeline_key: fetch_user_facts
-    inputs:
-      - extract_user_facts
-      - client_id
-      - project_id
-      - session_id
-      - input_text
-    queue: io_queue
-  
-  - step: naive-rag-inference
-    pipeline_key: naive-rag-inference
+  - step: run_vector_rag
+    pipeline_key: run-vector-rag
     inputs:
       - input_text
       - search_relevant_chunks
       - fetch_chat_history
       - fetch_user_facts
+      - language
+    queue: io_queue
+  
+  - step: combine_vector_response_and_references
+    pipeline_key: combine_vector_response_and_references
+    section_id: llm_result_and_references
+    inputs:
+      - run_vector_rag
+      - GetVectorReference
+      - search_relevant_chunks
     queue: io_queue
   
   - step: save_vector_llm_message
     pipeline_key: save_vector_llm_message
     inputs: 
-      - naive-rag-inference
+      - run_vector_rag
       - client_id
       - project_id
       - session_id
+      - user_id
     queue: io_queue

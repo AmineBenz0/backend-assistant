@@ -1,8 +1,7 @@
 """
 Domain-specific configurations for the LLM Gateway.
 
-This package contains domain-specific prompt configurations that can be used
-to customize the Graph Builder for different use cases.
+This package contains domain-specific prompt configurations.
 """
 
 from .base_defaults import BASE_DEFAULTS_MAP
@@ -12,7 +11,8 @@ from .scientific_domain import SCIENTIFIC_DOMAIN_CONFIG, configure_scientific_do
 from .legal_domain import LEGAL_DOMAIN_CONFIG, configure_legal_domain
 from .financial_domain import FINANCIAL_DOMAIN_CONFIG, configure_financial_domain
 from .news_domain import NEWS_DOMAIN_CONFIG, configure_news_domain
-from .dpac_domain import DPAC_DOMAIN_CONFIG, configure_dpac_domain
+from .en_dpac_domain import EN_DPAC_DOMAIN_CONFIG, en_configure_dpac_domain
+from .it_dpac_domain import  IT_DPAC_DOMAIN_CONFIG, it_configure_dpac_domain
 
 __all__ = [
     'BASE_DEFAULTS_MAP',
@@ -21,6 +21,7 @@ __all__ = [
     'SCIENTIFIC_DOMAIN_CONFIG', 'configure_scientific_domain',
     'LEGAL_DOMAIN_CONFIG', 'configure_legal_domain',
     'FINANCIAL_DOMAIN_CONFIG', 'configure_financial_domain',
-    'NEWS_DOMAIN_CONFIG', 'configure_news_domain'
-    'DPAC_DOMAIN_CONFIG', 'configure_dpac_domain'
+    'NEWS_DOMAIN_CONFIG', 'configure_news_domain',
+    'EN_DPAC_DOMAIN_CONFIG', 'en_configure_dpac_domain',
+    'IT_DPAC_DOMAIN_CONFIG', 'it_configure_dpac_domain'
 ]

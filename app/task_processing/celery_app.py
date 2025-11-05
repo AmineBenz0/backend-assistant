@@ -7,7 +7,15 @@ from app.pipelines.pipelines_app import execute_pipeline_step
 from app.utils.webhooks import CallbackTask
 from typing import Dict, Any
 import asyncio
+import copy
 import logging
+import random
+import re
+import time as _time
+try:
+    import openai
+except Exception:
+    openai = None
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +68,7 @@ def wait_for_task(task_id: str, timeout: int = 3600) -> Dict[str, Any]:
         logger.error(f"Prerequisite task {task_id} failed: {result.result}")
         raise result.result
 
-@celery_app.task(bind=True, base=CallbackTask, name='llm_call', autoretry_for=(Exception,), retry_kwargs={'max_retries': 2}, serializer='json', soft_time_limit=3600, time_limit=7200)
+@celery_app.task(bind=True, base=CallbackTask, name='llm_call', serializer='json', soft_time_limit=3600, time_limit=7200)
 def pipeline_call(self, workflow_id: str, step: str, step_input: Dict[str, Any], workflow_output: Dict[str, Any], step_outputs: Dict[str, str]):
     logger.info(f"Executing pipeline step: {step} for workflow {workflow_id}")
     inputs = step_input["inputs"]
@@ -108,17 +116,41 @@ def pipeline_call(self, workflow_id: str, step: str, step_input: Dict[str, Any],
 
     # Process inputs to resolve any remaining task IDs
     inputs = process_inputs(inputs)
-    
-    # Execute the pipeline step
+
+    # Parallel handling
+    parallel_task = step_input.get("parallel_task", False)
+    parallel_merge = step_input.get("parallel_merge", False)
+
+    if parallel_task and step_input.get("parallel_inputs"):
+        logger.info(f"Executing step {step} in parallel mode over inputs: {step_input.get('parallel_inputs')}")
+        response, version = process_parallel_tasks(
+            workflow_id, step_input, inputs, step, workflow_output, step_outputs, parallel_merge
+        )
+        return {
+            "workflow_id": workflow_id,
+            "action": step_input.get("action"),
+            "response": response,
+            "version": version,
+            "webhook_response": True if step_input.get("section_id") else False
+        }
+
+    # Execute the pipeline step sequentially
     try:
+        # Light pacing for io-bound tasks to reduce burst rate limiting
+        if step_input.get("queue") == "io_queue":
+            sleep_s = random.uniform(0.5, 2.0)
+            logger.info(f"Pacing io_queue task by {sleep_s:.2f}s before execution")
+            _time.sleep(sleep_s)
+
         logger.info(f"Executing pipeline step {step} with inputs: {list(inputs.keys())}")
         result = execute_pipeline_step(
             inputs=inputs,
             project_name=step_input["project_name"],
-            prompt_config_src=step_input["prompt_config_src"],
+            prompt_config=step_input["prompt_config"],
             pipeline_key=step_input["pipeline_key"],
             json_object=step_input.get("json_object", False),
-            domain_id=step_input.get("domain_id")
+            domain_id=step_input.get("domain_id"),
+            save_to_db=step_input.get("save_to_db")
         )
         logger.info(f"Successfully completed pipeline step {step}")
         return {
@@ -129,6 +161,31 @@ def pipeline_call(self, workflow_id: str, step: str, step_input: Dict[str, Any],
             "webhook_response": True if step_input.get("section_id") else False
         }
     except Exception as e:
+        # Detect rate-limits (HTTP 429) and apply exponential backoff with jitter
+        msg = str(e)
+        is_rate_limited = ("429" in msg) or (openai and isinstance(e, getattr(openai, "RateLimitError", Exception)))
+        if is_rate_limited:
+            attempt = (self.request.retries or 0) + 1
+            # If we've already tried enough times, fail hard so Celery marks FAILURE
+            if attempt >= 5:
+                logger.error(f"Rate limit persisted for step {step} after {attempt} attempts; failing the task")
+                raise
+            # Parse suggested retry-after seconds if present
+            retry_after = 2
+            m = re.search(r"retry after\s+(\d+)\s*seconds", msg, flags=re.IGNORECASE)
+            if m:
+                try:
+                    retry_after = max(1, int(m.group(1)))
+                except Exception:
+                    retry_after = 2
+            # Exponential backoff with cap and jitter; more conservative on io_queue
+            base = max(2, retry_after)
+            delay = min(base * (2 ** (attempt - 1)), 300)
+            delay = delay + random.uniform(0, min(5.0, delay / 5))
+            if step_input.get("queue") == "io_queue":
+                delay = min(delay * 1.5, 420)
+            logger.warning(f"Rate limit detected for step {step}. Retrying in {delay:.1f}s (attempt {attempt})")
+            raise self.retry(exc=e, countdown=int(delay))
         logger.error(f"Error executing pipeline step {step}: {e}", exc_info=True)
         raise
 
@@ -154,3 +211,97 @@ def process_inputs(inputs):
                     inputs.update({key: output})
     
     return inputs
+
+
+def process_parallel_tasks(workflow_id: str, step_input: Dict[str, Any], inputs: Dict[str, Any], step: str, workflow_output: Dict[str, Any], step_outputs: Dict[str, str], parallel_merge: bool):
+    """
+    Create and run sub-tasks in parallel for the given step.
+
+    - Uses the first key in parallel_inputs to determine iteration length
+    - For each index, sets each parallel_input to its ith element (or the same value if not a list)
+    - Queues a subtask for each item and aggregates responses
+    """
+    new_input = copy.deepcopy(step_input)
+    parallel_inputs_keys = step_input.get("parallel_inputs", [])
+    if not parallel_inputs_keys:
+        logger.warning("parallel_task enabled but no parallel_inputs specified; falling back to sequential")
+        result = execute_pipeline_step(
+            inputs=inputs,
+            project_name=step_input["project_name"],
+            prompt_config=step_input["prompt_config"],
+            pipeline_key=step_input["pipeline_key"],
+            json_object=step_input.get("json_object", False),
+            domain_id=step_input.get("domain_id"),
+            save_to_db=step_input.get("save_to_db")
+        )
+        return result, "new_version"
+
+    first_key = parallel_inputs_keys[0]
+    if first_key not in inputs:
+        logger.error(f"Parallel input '{first_key}' not found in inputs for step {step}")
+        return [], "parallel_error"
+
+    first_data = inputs[first_key]
+    if not isinstance(first_data, list):
+        logger.info(f"Parallel input '{first_key}' is not a list; treating as a single-item list for step {step}")
+        first_data = [first_data]
+
+    if not first_data:
+        logger.warning(f"Parallel input '{first_key}' is empty for step {step}")
+        return [], "parallel_empty"
+
+    sub_tasks = []
+    responses = []
+
+    for i in range(len(first_data)):
+        task_input = copy.deepcopy(new_input)
+        # Set parallel inputs for index i
+        for key in parallel_inputs_keys:
+            if key in inputs:
+                value = inputs[key]
+                if isinstance(value, list):
+                    task_input['inputs'][key] = value[i] if i < len(value) else None
+                else:
+                    task_input['inputs'][key] = value
+            else:
+                logger.warning(f"Parallel input '{key}' not found in inputs for subtask index {i}")
+                task_input['inputs'][key] = None
+
+        # Ensure subtasks run sequentially (no nested parallel)
+        task_input['parallel_task'] = False
+
+        sub_task = pipeline_call.apply_async(
+            args=[workflow_id, step, task_input, workflow_output, step_outputs],
+            queue=task_input.get('queue', 'default_queue')
+        )
+        sub_tasks.append(sub_task)
+        # Stagger io_queue enqueueing slightly to avoid burst RPM spikes
+        if task_input.get('queue') == 'io_queue':
+            _time.sleep(random.uniform(0.05, 0.25))
+
+    # Collect results
+    for idx, t in enumerate(sub_tasks):
+        try:
+            sub_result = wait_for_task(t.id)
+            # Expect dict with 'response'
+            responses.append(sub_result.get('response') if isinstance(sub_result, dict) else sub_result)
+        except Exception as e:
+            logger.error(f"Parallel subtask {idx+1}/{len(sub_tasks)} for step {step} failed: {e}")
+            responses.append(None)
+            # Fail-fast: if any parallel subtask failed, propagate failure so Celery marks FAILURE
+            # This ensures tasks with rate-limit or other errors are not reported as SUCCESS overall
+            raise
+
+    # Merge if requested
+    if parallel_merge:
+        merged = []
+        for item in responses:
+            if item is None:
+                continue
+            if isinstance(item, list):
+                merged.extend(item)
+            else:
+                merged.append(item)
+        responses = merged
+
+    return responses, "parallel"

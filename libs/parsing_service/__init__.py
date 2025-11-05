@@ -1,7 +1,7 @@
 """
 Parsing Service Module
 
-This module provides document parsing capabilities for the GraphRAG pipeline.
+This module provides document parsing capabilities for the VectorRAG pipeline.
 """
 
 from .service import ParsingGeneratorInterface, create_parsing_from_config, create_sync_parsing_adapter

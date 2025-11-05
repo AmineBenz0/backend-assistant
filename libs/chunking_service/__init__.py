@@ -1,18 +1,14 @@
 """
 Chunking Service Module
 
-This module provides document chunking capabilities for the GraphRAG pipeline.
+This module provides document chunking capabilities for the VectorRAG pipeline.
 """
 
 from .service import ChunkingGeneratorInterface
-from .chunking_generators.recursive_text_splitter import RecursiveTextSplitterGenerator
-
-# Optional import for semantic splitter
-try:
-    from .chunking_generators.semantic_splitter import SemanticSplitterGenerator
-    SEMANTIC_SPLITTER_AVAILABLE = True
-except ImportError:
-    SEMANTIC_SPLITTER_AVAILABLE = False
+from .chunking_generators.token_chunker import TokenChunkerGenerator
+from .chunking_generators.sentence_chunker import SentenceChunkerGenerator
+from .chunking_generators.recursive_chunker import RecursiveChunkerGenerator
+from .chunking_generators.chonkie_base import CHONKIE_AVAILABLE
 from .models import (
     ChunkingConfig,
     ChunkingMethod,
@@ -35,14 +31,17 @@ def create_chunking_from_config(config: dict) -> ChunkingGeneratorInterface:
     Returns:
         ChunkingGeneratorInterface instance
     """
-    provider = config.get("provider", "recursive_text_splitter")
+    provider = config.get("provider", "token_chunker")
     chunking_config = ChunkingConfig(**config.get("config", {}))
     
     return ChunkingGeneratorInterface(default_provider=provider)
 
 __all__ = [
     "ChunkingGeneratorInterface",
-    "RecursiveTextSplitterGenerator",
+    "TokenChunkerGenerator",
+    "SentenceChunkerGenerator",
+    "RecursiveChunkerGenerator",
+    "CHONKIE_AVAILABLE",
     "ChunkingConfig",
     "ChunkingMethod",
     "ChunkingResult",
@@ -53,7 +52,3 @@ __all__ = [
     "ChunkingResponse",
     "create_chunking_from_config",
 ]
-
-# Conditionally add SemanticSplitterGenerator if available
-if SEMANTIC_SPLITTER_AVAILABLE:
-    __all__.append("SemanticSplitterGenerator")

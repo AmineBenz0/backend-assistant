@@ -24,12 +24,6 @@ except ImportError:
     CHROMADB_AVAILABLE = False
 
 try:
-    from neo4j import GraphDatabase
-    NEO4J_AVAILABLE = True
-except ImportError:
-    NEO4J_AVAILABLE = False
-
-try:
     from minio import Minio
     MINIO_AVAILABLE = True
 except ImportError:
@@ -63,7 +57,6 @@ except ImportError:
 class DatabaseType(Enum):
     """Supported database types"""
     VECTOR = "vector"
-    GRAPH = "graph"
     STORAGE = "storage"
     CACHE = "cache"
 
@@ -134,20 +127,6 @@ class DatabaseConnectionManager:
                 }
             ),
             
-            # Neo4j Configuration
-            "neo4j": DatabaseConfig(
-                name="neo4j",
-                db_type=DatabaseType.GRAPH,
-                host=os.getenv("NEO4J_HOST", "localhost"),
-                port=int(os.getenv("NEO4J_PORT", "7687")),
-                username=os.getenv("NEO4J_USERNAME", "neo4j"),
-                password=os.getenv("NEO4J_PASSWORD", "password"),
-                database=os.getenv("NEO4J_DATABASE", "neo4j"),
-                uri=os.getenv("NEO4J_URI", "bolt://localhost:7687"),
-                timeout=int(os.getenv("NEO4J_TIMEOUT", "30")),
-                retry_attempts=int(os.getenv("NEO4J_RETRY_ATTEMPTS", "3"))
-            ),
-            
             # MinIO Configuration
             "minio": DatabaseConfig(
                 name="minio",
@@ -206,20 +185,6 @@ class DatabaseConnectionManager:
                     "class_name": os.getenv("WEAVIATE_CLASS_NAME", "KotaemonDocument")
                 }
             ),
-            
-            # ArangoDB Configuration
-            "arangodb": DatabaseConfig(
-                name="arangodb",
-                db_type=DatabaseType.GRAPH,
-                host=os.getenv("ARANGODB_HOST", "localhost"),
-                port=int(os.getenv("ARANGODB_PORT", "8529")),
-                username=os.getenv("ARANGODB_USERNAME", "root"),
-                password=os.getenv("ARANGODB_PASSWORD", "password"),
-                database=os.getenv("ARANGODB_DATABASE", "kotaemon"),
-                uri=os.getenv("ARANGODB_URL", "http://localhost:8529"),
-                timeout=int(os.getenv("ARANGODB_TIMEOUT", "30")),
-                retry_attempts=int(os.getenv("ARANGODB_RETRY_ATTEMPTS", "3"))
-            )
         }
         
         # Set up fallback configurations
@@ -232,10 +197,6 @@ class DatabaseConnectionManager:
             self.configs["chromadb"].fallback_configs.append(self.configs["qdrant"])
         if "chromadb" in self.configs and "weaviate" in self.configs:
             self.configs["chromadb"].fallback_configs.append(self.configs["weaviate"])
-        
-        # Graph database fallbacks: Neo4j -> ArangoDB
-        if "neo4j" in self.configs and "arangodb" in self.configs:
-            self.configs["neo4j"].fallback_configs.append(self.configs["arangodb"])
     
     def test_connection(self, config: DatabaseConfig) -> ConnectionResult:
         """Test connection to a specific database"""
@@ -244,8 +205,6 @@ class DatabaseConnectionManager:
         try:
             if config.name == "chromadb":
                 return self._test_chromadb_connection(config, start_time)
-            elif config.name == "neo4j":
-                return self._test_neo4j_connection(config, start_time)
             elif config.name == "minio":
                 return self._test_minio_connection(config, start_time)
             elif config.name == "redis":
@@ -254,8 +213,6 @@ class DatabaseConnectionManager:
                 return self._test_qdrant_connection(config, start_time)
             elif config.name == "weaviate":
                 return self._test_weaviate_connection(config, start_time)
-            elif config.name == "arangodb":
-                return self._test_arangodb_connection(config, start_time)
             else:
                 return ConnectionResult(
                     config=config,
@@ -313,48 +270,7 @@ class DatabaseConnectionManager:
                 connection_time=time.time() - start_time,
                 error=e
             )
-    
-    def _test_neo4j_connection(self, config: DatabaseConfig, start_time: float) -> ConnectionResult:
-        """Test Neo4j connection"""
-        if not NEO4J_AVAILABLE:
-            return ConnectionResult(
-                config=config,
-                status=ConnectionStatus.UNAVAILABLE,
-                message="Neo4j driver not available. Install with: pip install neo4j",
-                connection_time=time.time() - start_time
-            )
-        
-        try:
-            # Create Neo4j driver
-            driver = GraphDatabase.driver(
-                config.uri,
-                auth=(config.username, config.password),
-                connection_timeout=config.timeout
-            )
-            
-            # Test connection
-            with driver.session(database=config.database) as session:
-                result = session.run("RETURN 1 as test")
-                test_value = result.single()["test"]
-                
-                if test_value == 1:
-                    return ConnectionResult(
-                        config=config,
-                        status=ConnectionStatus.CONNECTED,
-                        message="Connected successfully. Database is responsive.",
-                        connection_time=time.time() - start_time,
-                        client=driver
-                    )
-        
-        except Exception as e:
-            return ConnectionResult(
-                config=config,
-                status=ConnectionStatus.ERROR,
-                message=f"Neo4j connection failed: {str(e)}",
-                connection_time=time.time() - start_time,
-                error=e
-            )
-    
+
     def _test_minio_connection(self, config: DatabaseConfig, start_time: float) -> ConnectionResult:
         """Test MinIO connection"""
         if not MINIO_AVAILABLE:
@@ -719,7 +635,7 @@ def test_database_connections(database_names: Optional[List[str]] = None, use_fa
     manager.print_connection_results()
     
     # Check if we have at least one working database of each required type
-    required_types = [DatabaseType.VECTOR, DatabaseType.GRAPH, DatabaseType.STORAGE]
+    required_types = [DatabaseType.VECTOR, DatabaseType.STORAGE]
     available_types = []
     
     for db_type in required_types:

@@ -3,12 +3,19 @@ Data models for the chunking service
 """
 from datetime import datetime
 from enum import Enum
-from typing import Dict, List, Optional, Any, Union
+from typing import Dict, List, Optional, Any, Union, Literal
 from pydantic import BaseModel, Field
 
 
 class ChunkingMethod(str, Enum):
     """Types of chunking methods"""
+    # Chonkie methods
+    TOKEN_CHUNKER = "token_chunker"
+    SENTENCE_CHUNKER = "sentence_chunker"
+    RECURSIVE_CHUNKER = "recursive_chunker"
+    LATE_CHUNKER = "late_chunker"
+    SEMANTIC_CHUNKER = "semantic_chunker"
+    # Legacy methods (deprecated)
     RECURSIVE = "recursive"
     SEMANTIC = "semantic"
     FIXED_SIZE = "fixed_size"
@@ -33,20 +40,41 @@ class ChunkingConfig(BaseModel):
     """Configuration for document chunking"""
     chunk_size: int = 1000
     chunk_overlap: int = 200
-    method: ChunkingMethod = ChunkingMethod.RECURSIVE
+    method: ChunkingMethod = ChunkingMethod.TOKEN_CHUNKER
     separators: Optional[List[str]] = None
     keep_separator: bool = False
     add_start_index: bool = False
     strip_whitespace: bool = True
     is_separator_regex: bool = False
     
-    # Semantic chunking specific
+    # Chonkie-specific parameters
+    tokenizer_model: Optional[str] = None
+    embeddings_model: Optional[str] = None
+    embeddings_provider: Optional[str] = None
+    
+    # Legacy semantic chunking specific (deprecated)
     breakpoint_threshold_type: str = "percentile"
     breakpoint_threshold_amount: int = 95
     embedding_model: Optional[str] = None
     
     # Additional provider-specific settings
     custom_settings: Dict[str, Any] = Field(default_factory=dict)
+    
+    # Advanced parameters for specific chunkers
+    min_sentences_per_chunk: Optional[int] = None
+    min_characters_per_sentence: Optional[int] = None
+    min_characters_per_chunk: Optional[int] = None  # For LateChunker
+    min_chunk_size: Optional[int] = None  # For SemanticChunker
+    
+    # SemanticChunker-specific parameters
+    semantic_threshold: Optional[float] = 0.8
+    similarity_window: Optional[int] = 1  # Default from Chonkie docs
+    custom_delimiters: Optional[List[str]] = None
+    include_delimiter: Optional[Literal["prev", "next"]] = "prev"
+    skip_window: Optional[int] = 0
+    filter_window: Optional[int] = 5
+    filter_polyorder: Optional[int] = 3
+    filter_tolerance: Optional[float] = 0.2
 
 
 class ChunkMetadata(BaseModel):

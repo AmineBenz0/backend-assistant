@@ -40,6 +40,7 @@ except ImportError as e:
     logger.error("Langfuse package not available. Install it via: pip install langfuse")
     raise ImportError("Langfuse package is required for prompt management") from e
 
+from libs.llm_service.utils import parse_llm_json_response
 
 # PromptType enum completely removed - system is now fully agnostic
 # Use string prompt keys directly: manager.get_any_prompt("entity-extraction", variables)
@@ -58,8 +59,16 @@ class LangfusePromptTemplate:
         """Compile the prompt template with variables"""
         try:
             return self.content.format(**variables)
-        except KeyError as e:
-            raise ValueError(f"Missing template variable: {e}")
+        except (KeyError, IndexError, ValueError) as e:
+            # Fallback: perform conservative placeholder substitution for known variables
+            # without interpreting other braces (e.g., Cypher maps {name: '...'}).
+            safe_text = self.content
+            for key, value in variables.items():
+                try:
+                    safe_text = safe_text.replace("{" + key + "}", str(value))
+                except Exception:
+                    continue
+            return safe_text
     
     def get_default_values(self) -> Dict[str, str]:
         """Get default values for common optional variables"""
@@ -69,7 +78,11 @@ class LangfusePromptTemplate:
             'completion_delimiter': '<|COMPLETE|>',
             'max_entities': '10',
             'language': 'English',
-            'domain': 'general'
+            'domain': 'general',
+            # Prompt variables that may be absent depending on step wiring
+            'subqueries': '[]',
+            'relationship_tripplets': '[]',
+            'schema': ''
         }
 
 
@@ -186,51 +199,94 @@ class LangfusePromptManager:
     """
     Centralized prompt manager using Langfuse as the source
     
-    This replaces the file-based GraphRAGPromptManager with Langfuse integration.
+    This replaces the file-based VectorRAGPromptManager with Langfuse integration.
     """
     
     def __init__(self, 
                  prompt_source: Optional[PromptSource] = None,
-                 default_label: str = "production"):
+                 default_language: str = "en",
+                 organization_name: Optional[str] = None,
+                 project_name: Optional[str] = None):
         """
         Initialize the Langfuse prompt manager
         
         Args:
             prompt_source: Custom prompt source (defaults to LangfusePromptSource)
-            default_label: Default label to use when fetching prompts
+            default_language: Default language to use when fetching prompts (defaults to "en")
+            organization_name: Organization name for logging/validation
+            project_name: Project name for logging/validation
         """
         self.prompt_source = prompt_source or LangfusePromptSource()
-        self.default_label = default_label
+        
+        # Use language as label - no more "production" or "latest"
+        # Default to English if not specified
+        self.default_language = default_language
+        
+        self.organization_name = organization_name
+        self.project_name = project_name
         self._cache: Dict[str, LangfusePromptTemplate] = {}
         
-        logger.info("Initialized LangfusePromptManager")
+        logger.info(f"Initialized LangfusePromptManager (org: {organization_name}, project: {project_name}, default_language: {self.default_language})")
     
-    def get_prompt(self, prompt_key: str, label: Optional[str] = None) -> LangfusePromptTemplate:
+    def get_prompt(self, prompt_key: str, label: Optional[str] = None, language: Optional[str] = None) -> LangfusePromptTemplate:
         """
-        Get a prompt template by key
+        Get a prompt template by key, with language-based label routing
         
         Args:
             prompt_key: The prompt key/name in Langfuse (e.g., "entity-extraction", "my-custom-prompt")
-            label: Optional label override (defaults to default_label)
+            label: Optional label override (for backward compatibility, but language takes precedence)
+            language: Language code ('en' or 'it'). This is used as the label to fetch language-specific prompt.
             
         Returns:
             LangfusePromptTemplate instance
+            
+        Note:
+            This method ONLY uses language labels ('en', 'it'). 
+            No fallback to 'production' or 'latest' labels.
         """
-        effective_label = label or self.default_label
+        # Determine the language to use
+        effective_language = language or self.default_language
+        
+        # Validate language
+        if effective_language not in ["en", "it", "fr"]:
+            logger.warning(f"Invalid language '{effective_language}', defaulting to '{self.default_language}'")
+            effective_language = self.default_language
+        
+        # Use language as the label
+        effective_label = effective_language
         cache_key = f"{prompt_key}:{effective_label}"
         
         # Check cache first
         if cache_key in self._cache:
+            logger.info(f"Using cached prompt: {prompt_key} (label: {effective_label})")
             return self._cache[cache_key]
         
-        # Fetch from Langfuse
+        # Fetch from Langfuse using language as label
         try:
             template = self.prompt_source.fetch_prompt(prompt_key, effective_label)
             self._cache[cache_key] = template
+            logger.info(f"Fetched prompt: {prompt_key} (label: {effective_label})")
             return template
         except Exception as e:
-            logger.error(f"Failed to get prompt '{prompt_key}': {e}")
-            raise
+            logger.warning(f"Failed to get prompt '{prompt_key}' with label '{effective_label}': {e}")
+            
+            # Fallback: try common labels if language-specific label fails
+            fallback_labels = ["latest", "production"]
+            for fallback_label in fallback_labels:
+                try:
+                    logger.info(f"Trying fallback label '{fallback_label}' for prompt '{prompt_key}'")
+                    template = self.prompt_source.fetch_prompt(prompt_key, fallback_label)
+                    self._cache[cache_key] = template
+                    logger.info(f"Fetched prompt: {prompt_key} (fallback label: {fallback_label})")
+                    return template
+                except Exception as fallback_error:
+                    logger.warning(f"Fallback label '{fallback_label}' also failed: {fallback_error}")
+                    continue
+            
+            # If all attempts failed, raise error
+            logger.error(f"Failed to get prompt '{prompt_key}' with label '{effective_label}' and fallback labels {fallback_labels}")
+            logger.error(f"Make sure you have ingested prompts with: python scripts/ingest_langfuse_prompts.py --language {effective_label}")
+            raise RuntimeError(f"Prompt '{prompt_key}' not found with label '{effective_label}' or fallback labels. Please check Langfuse connection and prompt ingestion.") from e
     
     def get_formatted_prompt(self, 
                            prompt_key: str, 
@@ -243,13 +299,31 @@ class LangfusePromptManager:
         Args:
             prompt_key: The prompt key/name in Langfuse (e.g., "entity-extraction", "my-custom-prompt")
             variables: Variables to substitute in the template
-            label: Optional label override
+            label: Optional label override (deprecated, language is used instead)
             domain_id: Optional domain configuration (e.g., "resume", "scientific")
             
         Returns:
             Formatted prompt string
         """
-        template = self.get_prompt(prompt_key, label)
+        # Extract language from variables to route to correct prompt
+        language = variables.get("language")
+        if isinstance(language, str):
+            # Normalize language to lowercase 2-letter code
+            language = language.lower().strip()
+
+            if language in ["english", "inglese", "en"]:
+                language = "en"
+            elif language in ["french", "français", "francais", "fr"]:
+                language = "fr"
+            else:
+                # If invalid language, use default
+                logger.warning(f"Invalid language value '{language}', using default '{self.default_language}'")
+                language = self.default_language
+        else:
+            # If no language specified, use default
+            language = self.default_language
+        
+        template = self.get_prompt(prompt_key, label, language)
         
         # Apply domain-specific defaults and transformations
         enhanced_variables = self._apply_domain_configuration(
@@ -270,7 +344,70 @@ class LangfusePromptManager:
         print(f'{template=}')
         print(f'{final_variables=}')
         
-        return template.compile(final_variables)
+        compiled = template.compile(final_variables)
+        return compiled
+
+
+    def get_formatted_prompt_and_config(
+        self,
+        prompt_key: str,
+        variables: Dict[str, Any],
+        label: Optional[str] = None,
+        domain_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Return both the formatted prompt text and the associated Langfuse config.
+
+        Args:
+            prompt_key: The prompt key/name in Langfuse
+            variables: Variables to substitute in the template
+            label: Optional label override (deprecated, language is used instead)
+            domain_id: Optional domain configuration
+
+        Returns:
+            { "prompt": str, "config": Dict[str, Any] }
+        """
+        # Extract language from variables to route to correct prompt
+        language = variables.get("language")
+        if isinstance(language, str):
+            # Normalize language to lowercase 2-letter code
+            language = language.lower().strip()
+            if language in ["english", "inglese", "en"]:
+                language = "en"
+            elif language in ["french", "français", "francais", "fr"]:
+                language = "fr"
+            else:
+                # If invalid language, use default
+                logger.warning(f"Invalid language value '{language}', using default '{self.default_language}'")
+                language = self.default_language
+        else:
+            # If no language specified, use default
+            language = self.default_language
+        
+        template = self.get_prompt(prompt_key, label, language)
+
+        # Apply domain-specific defaults and transformations
+        enhanced_variables = self._apply_domain_configuration(
+            prompt_key, variables, domain_id
+        )
+
+        # Transform inputs to match prompt expectations
+        transformed_variables = self._transform_inputs_to_prompt_format(
+            prompt_key, enhanced_variables
+        )
+
+        # Add base default values for common optional variables
+        defaults = template.get_default_values()
+        final_variables = {**defaults, **transformed_variables}
+
+        print('################## LangfusePromptManager.get_formatted_prompt_and_config ##################')
+        print(f'{final_variables=}')
+
+        compiled = template.compile(final_variables)
+        return {
+            "prompt": compiled,
+            "config": template.config or {}
+        }
     
     def get_any_prompt(self, 
                       prompt_key: str, 
@@ -281,10 +418,12 @@ class LangfusePromptManager:
         Get any prompt from Langfuse by key with optional variable substitution
         
         This is the main method to use for any prompt - no need to maintain enums or specific methods.
+        Language routing is automatic based on the 'language' variable.
         
         Args:
             prompt_key: The prompt key/name in Langfuse (e.g., "entity-extraction", "my-custom-prompt")
-            variables: Optional variables to substitute in the template
+            variables: Optional variables to substitute in the template. If 'language' is provided,
+                      will automatically route to language-specific prompt (e.g., "prompt-key-it")
             label: Optional label override (defaults to default_label)
             domain_id: Optional domain configuration (e.g., "resume", "scientific")
             
@@ -301,17 +440,18 @@ class LangfusePromptManager:
                 "entity_types": "PERSON,ORGANIZATION"
             })
             
-            # Get a prompt with domain configuration
+            # Get a prompt with language routing (automatically uses "resume-analysis-it")
             prompt = manager.get_any_prompt("resume-analysis", {
-                "resume_text": "..."
+                "resume_text": "...",
+                "language": "it"
             }, domain_id="resume")
         """
         if variables is None:
-            # Just return the raw template
+            # Just return the raw template (no language routing without variables)
             template = self.get_prompt(prompt_key, label)
             return template.content
         else:
-            # Return formatted prompt
+            # Return formatted prompt (with automatic language routing)
             return self.get_formatted_prompt(prompt_key, variables, label, domain_id)
     
     def list_available_prompts(self, label: Optional[str] = None) -> List[str]:
@@ -396,6 +536,8 @@ class LangfusePromptManager:
                 for key, domain_value in domain_config[pipeline_key].items():
                     enhanced_variables[key] = domain_value
                     logger.debug(f"Applied domain override {key} for {pipeline_key} (domain: {domain_id})")
+            # Expose domain_id downstream for transforms that may need it
+            enhanced_variables["domain_id"] = domain_id
         
         return enhanced_variables
     
@@ -416,7 +558,13 @@ class LangfusePromptManager:
             "legal": "libs.promptStore_service.domain_configs.legal_domain.LEGAL_DOMAIN_CONFIG",
             "financial": "libs.promptStore_service.domain_configs.financial_domain.FINANCIAL_DOMAIN_CONFIG",
             "news": "libs.promptStore_service.domain_configs.news_domain.NEWS_DOMAIN_CONFIG",
+            # Backward-compatible keys
             "dpac": "libs.promptStore_service.domain_configs.dpac_domain.DPAC_DOMAIN_CONFIG",
+            "dpac_it": "libs.promptStore_service.domain_configs.it_dpac_domain.IT_DPAC_DOMAIN_CONFIG",
+            # New explicit language keys
+            "en_dpac": "libs.promptStore_service.domain_configs.en_dpac_domain.EN_DPAC_DOMAIN_CONFIG",
+            "it_dpac": "libs.promptStore_service.domain_configs.it_dpac_domain.IT_DPAC_DOMAIN_CONFIG",
+            "fr_dpac": "libs.promptStore_service.domain_configs.fr_dpac_domain.FR_DPAC_DOMAIN_CONFIG",
         }
         
         if domain_id not in domain_configs:
@@ -430,7 +578,7 @@ class LangfusePromptManager:
         except Exception as e:
             logger.error(f"Failed to load domain config for '{domain_id}': {e}")
             return None
-    
+
     def _transform_inputs_to_prompt_format(self, 
                                          prompt_key: str, 
                                          variables: Dict[str, Any]) -> Dict[str, Any]:
@@ -448,166 +596,8 @@ class LangfusePromptManager:
         transformed = variables.copy()
         logger.info('############################## LangfusePromptManager._transform_inputs_to_prompt_format ###############################')
         logger.info(f'{transformed=}')
-        
-        if pipeline_key == "extract-entities":
-            # Transform chunk_documents to input_text
-            if "chunk_documents" in transformed and "input_text" not in transformed:
-                chunks = transformed["chunk_documents"]
-                logger.debug(f"Processing {len(chunks) if isinstance(chunks, list) else 'non-list'} chunks for extract-entities")
-                
-                if isinstance(chunks, list) and chunks:
-                    combined_text = ""
-                    for i, chunk in enumerate(chunks):
-                        if isinstance(chunk, dict):
-                            text = chunk.get("text", "")
-                            if text:
-                                combined_text += text + "\n\n"
-                            else:
-                                logger.warning(f"Chunk {i} has no text field or empty text. Keys: {list(chunk.keys())}")
-                        else:
-                            logger.warning(f"Chunk {i} is not a dict: {type(chunk)}")
-                    
-                    if combined_text.strip():
-                        transformed["input_text"] = combined_text.strip()
-                        logger.debug(f"Transformed chunk_documents to input_text ({len(combined_text)} chars)")
-                    else:
-                        logger.error("No text content found in chunks - combined_text is empty")
-                        transformed["input_text"] = ""
-                else:
-                    logger.error(f"chunk_documents is not a valid list: {type(chunks)}")
-                    transformed["input_text"] = ""
-            elif "input_text" not in transformed:
-                logger.error("No chunk_documents found and no input_text provided")
-                transformed["input_text"] = ""
-        
-        elif pipeline_key == "relationship-extraction":
-            # Transform chunk_documents to input_text
-            if "chunk_documents" in transformed and "input_text" not in transformed:
-                chunks = transformed["chunk_documents"]
-                if isinstance(chunks, list) and chunks:
-                    combined_text = ""
-                    for chunk in chunks:
-                        if isinstance(chunk, dict):
-                            text = chunk.get("text", "")
-                            if text:
-                                combined_text += text + "\n\n"
-                    
-                    transformed["input_text"] = combined_text.strip()
-                    logger.debug(f"Transformed chunk_documents to input_text for relationships ({len(combined_text)} chars)")
-        
-        elif pipeline_key == "community-report":
-            # Transform extract_relationships to input_text
-            if "extract_relationships" in transformed and "input_text" not in transformed:
-                relationships = transformed["extract_relationships"]
-                
-                # Handle both raw string responses and parsed lists
-                if isinstance(relationships, str):
-                    # Raw LLM response - use as-is for community report
-                    transformed["input_text"] = relationships
-                    logger.debug(f"Used raw extract_relationships as input_text ({len(relationships)} chars)")
-                elif isinstance(relationships, list) and relationships:
-                    # Parsed relationships - format them
-                    formatted_text = "Relationships:\n"
-                    for rel in relationships:
-                        if isinstance(rel, dict):
-                            source = rel.get("source_entity", rel.get("source", ""))
-                            target = rel.get("target_entity", rel.get("target", ""))
-                            rel_type = rel.get("relationship_type", "RELATED_TO")
-                            description = rel.get("description", "")
-                            strength = rel.get("relationship_strength", rel.get("weight", ""))
-                            
-                            if source and target:
-                                formatted_text += f"- {source} -> {target} ({rel_type})"
-                                if description:
-                                    formatted_text += f": {description}"
-                                if strength:
-                                    formatted_text += f" [strength: {strength}]"
-                                formatted_text += "\n"
-                        elif isinstance(rel, str):
-                            formatted_text += f"- {rel}\n"
-                    
-                    transformed["input_text"] = formatted_text
-                    logger.debug(f"Transformed parsed relationships to input_text ({len(formatted_text)} chars)")
-                else:
-                    # Fallback
-                    transformed["input_text"] = str(relationships) if relationships else "No relationships found"
-                    logger.warning(f"Unexpected relationships format: {type(relationships)}, using string conversion")
-        
-        elif pipeline_key == "summarize-descriptions":
-            # Transform various inputs to descriptions format
-            if "descriptions" not in transformed:
-                descriptions = []
-                
-                if "extract_entities" in transformed:
-                    entities = transformed["extract_entities"]
-                    if isinstance(entities, list):
-                        for entity in entities:
-                            if isinstance(entity, dict) and "description" in entity:
-                                descriptions.append(entity["description"])
-                
-                if descriptions:
-                    transformed["descriptions"] = "\n\n".join(descriptions)
-                    logger.debug(f"Transformed inputs to descriptions ({len(descriptions)} descriptions)")
 
-        elif pipeline_key == "run-graph-rag":
-            # Pull references from run_cypher_query result
-            cypher_result = transformed.get("run_cypher_query", {})
-            mem0_results = transformed.get("fetch_user_facts", {})
-    
-
-            if isinstance(cypher_result, dict) and isinstance(mem0_results, dict):
-                references = cypher_result.get("references", [])
-                
-                user_facts =mem0_results.get("results", [])
-                user_facts =[item["memory"] for item in user_facts if "memory" in item]
-
-                # Ensure it's a string (prompt templates expect a string)
-                transformed["references"] = json.dumps(references, indent=2)
-                transformed["user_facts"] = json.dumps(user_facts, indent=2)
-
-                logger.info(f'after {references=}')
-                logger.info(f'after {user_facts=}')
-            else:
-                logger.info('!!!!!!!!!!!!!!!!!! EMPTY references OR EMPTY user_facts !!!!!!!!!!!!!!!!!')
-                logger.info(f'{cypher_result=} {mem0_results=}')
-                # Fallback: always set references to avoid KeyError
-                transformed["references"] = "[]"
-        
-        elif pipeline_key == "out-of-context-detection":
-            # Format topics as bulleted list for the prompt
-            if "topics" in transformed and isinstance(transformed["topics"], list):
-                # Convert list of topics to formatted string
-                topics_list = transformed["topics"]
-                formatted_topics = "\n".join([f'    - "{topic}"' for topic in topics_list])
-                transformed["topics"] = formatted_topics
-            elif "topics" not in transformed:
-                # Fallback to generic topics
-                generic_topics = [
-                    "General knowledge questions",
-                    "Technology and software", 
-                    "Business and organizations"
-                ]
-                formatted_topics = "\n".join([f'    - "{topic}"' for topic in generic_topics])
-                transformed["topics"] = formatted_topics
-        
-        elif pipeline_key == "sensitive-topics-detection":
-            # Format topics as bulleted list for the prompt
-            if "topics" in transformed and isinstance(transformed["topics"], list):
-                # Convert list of topics to formatted string
-                topics_list = transformed["topics"]
-                formatted_topics = "\n".join([f'    - "{topic}"' for topic in topics_list])
-                transformed["topics"] = formatted_topics
-            elif "topics" not in transformed:
-                # Fallback to generic sensitive topics
-                generic_topics = [
-                    "Personal information",
-                    "Confidential business data",
-                    "Security-related information"
-                ]
-                formatted_topics = "\n".join([f'    - "{topic}"' for topic in generic_topics])
-                transformed["topics"] = formatted_topics
-
-        elif pipeline_key == "naive-rag-inference":
+        if pipeline_key == "run-vector-rag":
             # Transform inputs for naive RAG inference
             # Get relevant chunks from search_relevant_chunks
             search_results = transformed.get("search_relevant_chunks", {})
@@ -620,14 +610,8 @@ class LangfusePromptManager:
                     for i, chunk in enumerate(chunks, 1):
                         if isinstance(chunk, dict):
                             text = chunk.get("text", "")
-                            metadata = chunk.get("metadata", {})
-                            # Try different possible source fields
-                            source = (metadata.get("source_document_name") or 
-                                    metadata.get("document_filename") or 
-                                    metadata.get("source") or 
-                                    f"Document {i}")
                             if text:
-                                relevant_chunks_text += f"Source: {source}\n{text}\n\n"
+                                relevant_chunks_text += f"- {text}\n\n"
                     transformed["relevant_chunks"] = relevant_chunks_text.strip()
                     logger.debug(f"Transformed search_relevant_chunks to relevant_chunks ({len(relevant_chunks_text)} chars)")
                 else:
@@ -684,7 +668,6 @@ class LangfusePromptManager:
             else:
                 transformed["extract_user_facts"] = "No user facts available."
                 logger.warning("fetch_user_facts is not a valid dict")
-
         
         return transformed
 
@@ -717,98 +700,6 @@ class LangfusePromptManager:
         except Exception as e:
             logger.error(f"Failed to preload prompts: {e}")
             raise
-    
-    # Convenience methods for common GraphRAG prompts
-    # These are kept for backward compatibility but use string keys internally
-    def get_entity_extraction_prompt(self, 
-                                   input_text: str, 
-                                   entity_types: List[str],
-                                   **kwargs) -> str:
-        """Get formatted entity extraction prompt"""
-        variables = {
-            "input_text": input_text,
-            "entity_types": ",".join(entity_types),
-            **kwargs
-        }
-        return self.get_formatted_prompt("entity-extraction", variables)
-    
-    def get_relationship_extraction_prompt(self, 
-                                         input_text: str, 
-                                         entities: List[str],
-                                         entity_types: Optional[List[str]] = None,
-                                         **kwargs) -> str:
-        """Get formatted relationship extraction prompt"""
-        if entity_types is None:
-            entity_types = ["PERSON", "ORGANIZATION", "LOCATION", "CONCEPT", "EVENT", "TECHNOLOGY"]
-        
-        variables = {
-            "input_text": input_text,
-            "entities": ",".join(entities),
-            "entity_types": ",".join(entity_types),
-            "text": input_text,  # Alias for templates expecting {text}
-            **kwargs
-        }
-        return self.get_formatted_prompt("relationship-extraction", variables)
-    
-    def get_community_report_prompt(self, 
-                                  community_id: str, 
-                                  entities: List[str], 
-                                  relationships: List[str],
-                                  **kwargs) -> str:
-        """Get formatted community report prompt"""
-        input_text = (
-            f"Community ID: {community_id}\n\nEntities:\n" +
-            "\n".join(entities) +
-            "\n\nRelationships:\n" +
-            "\n".join(relationships)
-        )
-        variables = {
-            "input_text": input_text,
-            **kwargs
-        }
-        return self.get_formatted_prompt("community-report", variables)
-    
-    def get_summarize_descriptions_prompt(self, 
-                                        descriptions: List[str],
-                                        **kwargs) -> str:
-        """Get formatted description summarization prompt"""
-        variables = {
-            "descriptions": "\n".join(descriptions),
-            **kwargs
-        }
-        return self.get_formatted_prompt("summarize-descriptions", variables)
-    
-    def get_claim_extraction_prompt(self, 
-                                  input_text: str,
-                                  **kwargs) -> str:
-        """Get formatted claim extraction prompt"""
-        variables = {
-            "input_text": input_text,
-            **kwargs
-        }
-        return self.get_formatted_prompt("claim-extraction", variables)
-    
-    def get_duplicate_detection_prompt(self, 
-                                     entity_type: str,
-                                     entity_list: str,
-                                     **kwargs) -> str:
-        """Get formatted duplicate detection prompt"""
-        variables = {
-            "entity_type": entity_type,
-            "entity_list": entity_list,
-            **kwargs
-        }
-        return self.get_formatted_prompt("duplicate-detection", variables)
-    
-    def get_entity_merging_prompt(self, 
-                                entity_list: str,
-                                **kwargs) -> str:
-        """Get formatted entity merging prompt"""
-        variables = {
-            "entity_list": entity_list,
-            **kwargs
-        }
-        return self.get_formatted_prompt("entity-merging", variables)
 
 
 # Global instance for easy access
@@ -819,5 +710,13 @@ def get_default_langfuse_prompt_manager() -> LangfusePromptManager:
     """Get the default global Langfuse prompt manager instance"""
     global _default_langfuse_prompt_manager
     if _default_langfuse_prompt_manager is None:
-        _default_langfuse_prompt_manager = LangfusePromptManager(default_label="latest")
+        _default_langfuse_prompt_manager = LangfusePromptManager(default_language="en")
     return _default_langfuse_prompt_manager
+
+
+def get_langfuse_prompt_manager_from_config(prompt_config: Dict[str, Any]) -> LangfusePromptManager:
+    """Create a Langfuse prompt manager from configuration"""
+    return LangfusePromptManager(
+        organization_name=prompt_config.get("organization_name"),
+        project_name=prompt_config.get("project_name")
+    )

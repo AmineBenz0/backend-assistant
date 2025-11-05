@@ -47,25 +47,8 @@ class DocumentChunk(BaseModel):
     end_char: int
     embedding: Optional[List[float]] = None
 
-
-class TextUnit(BaseModel):
-    """GraphRAG text unit - atomic text unit with metadata"""
-    text_unit_id: str
-    text: str
-    doc_id: str
-    chunk_id: str
-    n_tokens: int
-    document_ids: List[str] = Field(default_factory=list)
-    entity_ids: List[str] = Field(default_factory=list)
-    relationship_ids: List[str] = Field(default_factory=list)
-    covariate_ids: List[str] = Field(default_factory=list)
-    text_embedding: Optional[List[float]] = None
-    attributes: Dict[str, Any] = Field(default_factory=dict)
-
-
 __all__ = [
     "DocumentFormat",
     "DocumentMetadata",
     "DocumentChunk",
-    "TextUnit",
 ]

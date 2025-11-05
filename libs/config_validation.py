@@ -147,45 +147,6 @@ class EnvironmentValidator:
                 group="llm_alternative"
             ),
             
-            # GraphRAG Configuration
-            "GRAPHRAG_API_KEY": EnvironmentVariable(
-                name="GRAPHRAG_API_KEY",
-                required=True,
-                description="GraphRAG API key for knowledge graph construction",
-                validation_pattern=r"^[a-zA-Z0-9]{20,}$",
-                group="graph_builder"
-            ),
-            "GRAPHRAG_BASE_URL": EnvironmentVariable(
-                name="GRAPHRAG_BASE_URL",
-                required=False,
-                default_value="https://api.graphrag.ai",
-                description="GraphRAG API base URL",
-                validation_pattern=r"^https://.*$",
-                group="graph_builder"
-            ),
-            "GRAPHRAG_LLM_MODEL": EnvironmentVariable(
-                name="GRAPHRAG_LLM_MODEL",
-                required=False,
-                default_value="gpt-4o",
-                description="GraphRAG LLM model name",
-                group="graph_builder"
-            ),
-            "GRAPHRAG_EMBEDDING_MODEL": EnvironmentVariable(
-                name="GRAPHRAG_EMBEDDING_MODEL",
-                required=False,
-                default_value="text-embedding-3-large",
-                description="GraphRAG embedding model name",
-                group="graph_builder"
-            ),
-            "USE_CUSTOMIZED_GRAPHRAG_SETTING": EnvironmentVariable(
-                name="USE_CUSTOMIZED_GRAPHRAG_SETTING",
-                required=False,
-                default_value="true",
-                description="Whether to use customized GraphRAG configuration",
-                validation_function=self._validate_boolean,
-                group="graph_builder"
-            ),
-            
             # Database Configuration
             "CHROMADB_URL": EnvironmentVariable(
                 name="CHROMADB_URL",
@@ -208,37 +169,6 @@ class EnvironmentValidator:
                 default_value="8001",
                 description="ChromaDB port",
                 validation_function=self._validate_port,
-                group="database"
-            ),
-            
-            # Neo4j Configuration
-            "NEO4J_URI": EnvironmentVariable(
-                name="NEO4J_URI",
-                required=False,
-                default_value="bolt://localhost:7687",
-                description="Neo4j connection URI",
-                validation_pattern=r"^(bolt|neo4j)://.*:\d+/?$",
-                group="database"
-            ),
-            "NEO4J_USERNAME": EnvironmentVariable(
-                name="NEO4J_USERNAME",
-                required=False,
-                default_value="neo4j",
-                description="Neo4j username",
-                group="database"
-            ),
-            "NEO4J_PASSWORD": EnvironmentVariable(
-                name="NEO4J_PASSWORD",
-                required=False,
-                default_value="password",
-                description="Neo4j password",
-                group="database"
-            ),
-            "NEO4J_DATABASE": EnvironmentVariable(
-                name="NEO4J_DATABASE",
-                required=False,
-                default_value="neo4j",
-                description="Neo4j database name",
                 group="database"
             ),
             
@@ -616,7 +546,6 @@ class EnvironmentValidator:
             "AZURE_OPENAI_BASE_URL",
             "AZURE_OPENAI_CHAT_DEPLOYMENT",
             "AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT",
-            "GRAPHRAG_API_KEY"
         ]
         return all(os.getenv(var) for var in required_vars)
     
@@ -625,9 +554,6 @@ class EnvironmentValidator:
         return self._test_minimal_azure_openai() and all(
             os.getenv(var) for var in [
                 "AZURE_OPENAI_API_VERSION",
-                "GRAPHRAG_BASE_URL",
-                "GRAPHRAG_LLM_MODEL",
-                "GRAPHRAG_EMBEDDING_MODEL"
             ]
         )
     

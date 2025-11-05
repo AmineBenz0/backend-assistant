@@ -1,6 +1,7 @@
 import os
 import logging
 import asyncio
+import hashlib
 from typing import List, Dict, Any, Optional
 from .base import BaseVectorProvider
 
@@ -33,7 +34,6 @@ class ChromaVectorProvider(BaseVectorProvider):
             logger.info(f"Initializing ChromaDB client with host: {self.host}, port: {self.port}")
             
             # Use asyncio to run the synchronous ChromaDB operations in a thread pool
-            # This follows the same pattern as Neo4j and Weaviate providers
             import asyncio
             
             def _create_client():
@@ -57,7 +57,7 @@ class ChromaVectorProvider(BaseVectorProvider):
                     logger.warning(f"ChromaDB connection test failed: {e}")
                     return False
             
-            # Run client creation in thread pool (following Neo4j pattern)
+            # Run client creation in thread pool
             loop = asyncio.get_event_loop()
             self.client = await loop.run_in_executor(None, _create_client)
             logger.info("ChromaDB client created, testing connection...")
@@ -117,8 +117,17 @@ class ChromaVectorProvider(BaseVectorProvider):
                 return self.client.get_collection(collection_name)
             raise RuntimeError(f"Failed to ensure ChromaDB collection: {e}") from e
 
-    async def store_chunks(self, chunks: List[Dict[str, Any]], client_id: str, project_id: str) -> Dict[str, Any]:
-        """Store document chunks with embeddings, scoped to client_id and project_id."""
+    async def store_embedding(self, chunks_with_embeddings: List[Dict[str, Any]], client_id: str, project_id: str) -> Dict[str, Any]:
+        """Store a single set of chunks with embeddings, scoped to client_id and project_id.
+        
+        Args:
+            chunks_with_embeddings: List of chunks with their embeddings
+            client_id: Client identifier for data isolation
+            project_id: Project identifier for data isolation
+            
+        Returns:
+            Dictionary containing storage results
+        """
         try:
             if not self._initialized or not self.client:
                 raise RuntimeError("ChromaDB client not initialized")
@@ -129,12 +138,11 @@ class ChromaVectorProvider(BaseVectorProvider):
             # Use asyncio to run the synchronous ChromaDB operations in a thread pool
             import asyncio
             
-            def _store_chunks_sync():
+            def _store_embedding_sync():
                 successful_ids = []
                 failed_count = 0
-                attempted_count = 0
                 
-                logger.info(f"Storing {len(chunks)} chunks in ChromaDB collection: {collection.name}")
+                logger.info(f"Storing {len(chunks_with_embeddings)} chunks in ChromaDB collection: {collection.name}")
                 
                 # Prepare data for ChromaDB
                 documents = []
@@ -142,32 +150,69 @@ class ChromaVectorProvider(BaseVectorProvider):
                 metadatas = []
                 ids = []
                 
-                for i, chunk in enumerate(chunks):
-                    attempted_count += 1
+                for i, chunk in enumerate(chunks_with_embeddings):
                     try:
-                        # Derive object_name from chunk metadata if not present at root
+                        # Use existing chunk_id if available (from preprocessing pipeline)
+                        # This ensures consistency between ChromaDB and Elasticsearch
+                        chunk_id = chunk.get("chunk_id")
+                        
+                        if not chunk_id:
+                            # Fallback: Generate hash-based ID if not provided
+                            # Derive object_name from chunk metadata if not present at root
+                            object_name = (
+                                chunk.get("object_name")
+                                or chunk.get("metadata", {}).get("object_name", "")
+                                or chunk.get("metadata", {}).get("file_name", "")
+                            )
+
+                            # Get chunk text and language
+                            chunk_text = chunk.get("text", "")
+                            language = chunk.get("metadata", {}).get("language", "en")
+                            
+                            # Build a deterministic hash-based ID for the chunk
+                            # Include language, client, project, object name, and text to avoid collisions
+                            raw_id = f"{language}_{client_id}_{project_id}_{object_name}_{chunk_text}"
+                            chunk_id = hashlib.sha256(raw_id.encode("utf-8")).hexdigest()
+                            logger.warning(f"Generated chunk_id for chunk {i} (should be provided by preprocessing)")
+                        
+                        # Get object_name and file_name
                         object_name = (
                             chunk.get("object_name")
-                            or chunk.get("metadata", {}).get("source_document", {}).get("object_name", "")
+                            or chunk.get("metadata", {}).get("object_name", "")
+                            or chunk.get("metadata", {}).get("file_name", "")
                         )
-
-                        # Get chunk index from metadata
-                        chunk_index = chunk.get("metadata", {}).get("chunk_index")
-                        try:
-                            chunk_id_value = int(chunk_index) if chunk_index is not None else i
-                        except (TypeError, ValueError):
-                            chunk_id_value = i
+                        
+                        # Get chunk text
+                        chunk_text = chunk.get("text", "")
 
                         # Prepare document data
-                        documents.append(chunk["text"])
+                        documents.append(chunk_text)
                         embeddings.append(chunk.get("embedding", []))  # Assume embedding is pre-computed
-                        metadatas.append({
+                        
+                        # Build metadata
+                        chunk_metadata = {
                             "client_id": client_id,
                             "project_id": project_id,
                             "object_name": object_name,
-                            "chunk_id": chunk_id_value,
-                        })
-                        ids.append(f"{client_id}_{project_id}_{chunk_id_value}")
+                            "chunk_id": chunk_id,  # Use the provided or generated chunk_id
+                        }
+                        
+                        # Add file_name to metadata (extract from object_name or metadata)
+                        file_name = chunk.get("metadata", {}).get("file_name") or object_name
+                        if file_name:
+                            # Extract just the filename if it's a path
+                            import os
+                            file_name = os.path.basename(file_name) if '/' in file_name or '\\' in file_name else file_name
+                            chunk_metadata["file_name"] = file_name
+                        
+                        # Add any additional metadata from the chunk
+                        if "metadata" in chunk:
+                            for key, value in chunk["metadata"].items():
+                                if key not in chunk_metadata and isinstance(value, (str, int, float, bool)):
+                                    chunk_metadata[key] = value
+                        
+                        metadatas.append(chunk_metadata)
+                        ids.append(chunk_id)  # Use the same chunk_id
                         
                     except Exception as e:
                         logger.warning(f"Failed to prepare chunk {i}: {e}")
@@ -195,13 +240,21 @@ class ChromaVectorProvider(BaseVectorProvider):
             
             # Run the synchronous operation in a thread pool
             loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(None, _store_chunks_sync)
+            return await loop.run_in_executor(None, _store_embedding_sync)
         
         except Exception as e:
-            logger.error(f"Failed to store chunks in ChromaDB: {e}")
+            logger.error(f"Failed to store embedding in ChromaDB: {e}")
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
-            raise RuntimeError(f"Failed to store chunks in ChromaDB: {e}") from e
+            raise RuntimeError(f"Failed to store embedding in ChromaDB: {e}") from e
+
+    async def store_chunks(self, raw_chunk: Dict[str, Any], embedding: List[Dict[str, Any]], client_id: str, project_id: str) -> Dict[str, Any]:
+        """Store document chunks with embeddings, scoped to client_id and project_id.
+        
+        Deprecated: Use store_embedding instead. This method is kept for backward compatibility.
+        """
+        logger.warning("store_chunks is deprecated, use store_embedding instead")
+        return await self.store_embedding(embedding, client_id, project_id)
 
     async def similarity_search(self, query: str, client_id: str, project_id: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """Perform similarity search scoped to client_id and project_id."""
@@ -285,16 +338,22 @@ class ChromaVectorProvider(BaseVectorProvider):
                     where={"project_id": project_id}
                 )
                 
-                # Format results with similarity scores
+                # Format results with similarity scores and metadata
                 documents = []
                 if results['documents'] and results['documents'][0]:
                     for i, doc in enumerate(results['documents'][0]):
                         metadata = results['metadatas'][0][i] if results['metadatas'] and results['metadatas'][0] else {}
                         distance = results['distances'][0][i] if results.get('distances') and results['distances'][0] else 0.0
+                        
+                        # Extract chunk_id from metadata (stored during indexing)
+                        chunk_id = metadata.get('chunk_id', '')
+                        
                         documents.append({
                             "text": doc,
+                            "chunk_id": chunk_id,  # Include chunk_id at root level
                             "similarity": 1.0 - distance,  # Convert distance to similarity
-                            **metadata
+                            "metadata": metadata,  # Keep metadata nested for GetVectorReference
+                            **metadata  # Also flatten for backward compatibility
                         })
                 
                 return documents

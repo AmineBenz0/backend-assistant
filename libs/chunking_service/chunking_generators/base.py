@@ -33,14 +33,14 @@ class AbstractChunkingGenerator(ABC):
         pass
     
     @abstractmethod
-    async def chunk_text(
+    def chunk_text(
         self, 
         text: str,
         document_metadata: Optional[Dict[str, Any]] = None,
         **kwargs
     ) -> List[DocumentChunk]:
         """
-        Chunk text into document chunks
+        Chunk text into document chunks (must be implemented by subclasses)
         
         Args:
             text: Text to chunk
@@ -51,39 +51,6 @@ class AbstractChunkingGenerator(ABC):
             List of document chunks
         """
         pass
-    
-    def chunk_text(
-        self, 
-        text: str,
-        document_metadata: Optional[Dict[str, Any]] = None,
-        **kwargs
-    ) -> List[DocumentChunk]:
-        """
-        Chunk text into document chunks (synchronous version)
-        
-        Args:
-            text: Text to chunk
-            document_metadata: Optional metadata about the source document
-            **kwargs: Additional generator-specific parameters
-            
-        Returns:
-            List of document chunks
-        """
-        # Default implementation: run async version in event loop
-        import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # If we're already in an async context, we need to use a different approach
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(asyncio.run, self.chunk_text(text, document_metadata, **kwargs))
-                    return future.result()
-            else:
-                return loop.run_until_complete(self.chunk_text(text, document_metadata, **kwargs))
-        except RuntimeError:
-            # No event loop exists, create a new one
-            return asyncio.run(self.chunk_text(text, document_metadata, **kwargs))
     
     def chunk_document_for_rag_sync(
         self, 

@@ -1,5 +1,6 @@
 import json
 import re
+import ast
 
 def parse_llm_json_response(response: str) -> dict:
     """
@@ -19,24 +20,11 @@ def parse_llm_json_response(response: str) -> dict:
     """
     # Remove markdown fences like ```json ... ```
     cleaned = re.sub(r"^```json\s*|\s*```$", "", response.strip(), flags=re.DOTALL)
+    print('################## parse_llm_json_response ##################')
+    print(f'{cleaned=}')
 
     # Parse into Python dict
     return json.loads(cleaned)
-
-
-
-def clean_cypher_query(query: str) -> str:
-    """
-    Clean a generated Cypher query by removing escape characters and normalizing whitespace.
-    """
-    # Remove \n, \t, and \r
-    cleaned = query.replace("\\n", " ").replace("\\t", " ").replace("\\r", " ")
-
-    # Collapse multiple spaces into one
-    cleaned = re.sub(r"\s+", " ", cleaned)
-
-    # Strip leading/trailing spaces
-    return cleaned.strip()
 
 
 def flatten_dict(d: dict, parent_key: str = "", sep: str = ".") -> dict:
@@ -55,3 +43,19 @@ def flatten_dict(d: dict, parent_key: str = "", sep: str = ".") -> dict:
         else:
             items[new_key] = v
     return items
+
+
+
+def safe_literal_eval(value):
+    """
+    Try to safely evaluate a Python literal from a string.
+    If parsing fails (e.g., it's not valid Python literal syntax),
+    return the original value unchanged.
+    """
+    if not isinstance(value, str):
+        return value  # only try to eval strings
+
+    try:
+        return ast.literal_eval(value)
+    except (ValueError, SyntaxError):
+        return value

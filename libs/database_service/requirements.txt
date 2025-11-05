@@ -9,11 +9,6 @@ chromadb>=0.4.0
 # qdrant-client>=1.0.0     # Uncomment when implementing Qdrant
 # faiss-cpu>=1.7.0         # Uncomment when implementing FAISS
 
-# Graph database providers
-neo4j>=5.0.0
-# python-arango>=7.0.0     # Uncomment when implementing ArangoDB
-# pyorient>=1.5.0          # Uncomment when implementing OrientDB
-
 # Storage
 minio>=7.0.0
 

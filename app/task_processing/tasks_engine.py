@@ -35,12 +35,12 @@ def get_levels(inputs: dict, template_steps: list) -> list:
     return levels
 
 
-def format_steps(steps, section, project_name, prompt_config_src, database, domain_id=None):
+def format_steps(steps, section, project_name, prompt_config, database, domain_id=None):
     formatted_steps = {}
     for step in steps:
         step_config = {
             "project_name": project_name,
-            "prompt_config_src": prompt_config_src,
+            "prompt_config": prompt_config,
             "database": database,
             "pipeline_key": step['pipeline_key'],
             "action": step.get("action", "section"),
@@ -52,8 +52,14 @@ def format_steps(steps, section, project_name, prompt_config_src, database, doma
             "parallel_inputs": step.get("parallel_inputs", None),
             "json_object": step.get("json_object", False),
             "queue": step.get("queue", "default_queue"),
-            "parallel_merge": step.get("parallel_merge", False)
+            "parallel_merge": step.get("parallel_merge", False),
+            "save_to_db": step.get("save_to_db")
         }
+        
+        # Propagate language if provided at the top level
+        if isinstance(section, dict) and isinstance(section.get("inputs"), dict):
+            if "language" in section["inputs"]:
+                step_config["inputs"]["language"] = section["inputs"]["language"]
         
         # Only add domain_id if it's provided
         if domain_id:
@@ -98,13 +104,12 @@ def generate_tasks_structure(workflow_input: dict, template_config: dict):
     tasks = []
     workflow_id = workflow_input.get('workflow_id', 'default_workflow')
     
-    # For graph preprocessing, we expect 'documents' as a top-level input, not nested in 'sections'
     # Prepare inputs for the first level of tasks
     initial_inputs = workflow_input.copy()
     initial_inputs.update(template_config['defaults'])  # Add defaults to inputs
 
     project_name = template_config['defaults']['template_id']
-    prompt_config_src = template_config['defaults']['prompt_config_src']
+    prompt_config = template_config['defaults']['prompt_config']
     database = template_config['defaults']['database']
 
     required_config = template_config['steps']
@@ -113,7 +118,7 @@ def generate_tasks_structure(workflow_input: dict, template_config: dict):
     # Extract domain_id from workflow_input (optional)
     domain_id = workflow_input.get("domain_id")
     
-    steps = format_steps(required_config, {"inputs": initial_inputs}, project_name, prompt_config_src, database, domain_id)
+    steps = format_steps(required_config, {"inputs": initial_inputs}, project_name, prompt_config, database, domain_id)
 
     # Initialize empty outputs if not present
     workflow_output = workflow_input.get('outputs', {})

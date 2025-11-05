@@ -1,0 +1,90 @@
+defaults: &defaults
+  template_id: vector_preprocessing
+  prompt_config:
+    source: local
+  database: default
+
+task: vector_preprocessing
+<<: *defaults
+inputs:
+  - client_id
+  - project_id
+  - language
+  - embedding_model
+  - embedding_provider
+  - embedding_batch_size
+
+steps:
+  # Step 1: Get raw files from storage
+  - step: GetFiles
+    pipeline_key: GetFiles
+    inputs:
+      - client_id
+      - project_id
+    queue: localAPI_queue
+
+  # Step 2: Parse raw files into text content
+  - step: parse_documents
+    pipeline_key: ParseDocuments
+    inputs:
+      - GetFiles
+    save_to_db: minio
+    queue: localAPI_queue
+
+  # Step 3: Split documents into chunks for processing
+  - step: chunk_documents
+    pipeline_key: chunk_documents
+    inputs:
+      - parse_documents
+      - client_id
+      - project_id
+      - language
+    save_to_db: minio
+    queue: localAPI_queue
+    parallel_task: false
+
+  - step: generate_embeddings
+    pipeline_key: GenerateChunkEmbeddings
+    inputs:
+      - chunk_documents
+      - embedding_model
+      - embedding_provider
+      - embedding_batch_size
+    parallel_task: true
+    parallel_inputs:
+      - chunk_documents
+    parallel_merge: true
+    queue: localAPI_queue
+
+  - step: store_chunks_in_vector_db
+    pipeline_key: StoreChunksInVectorDB
+    inputs:
+      - generate_embeddings
+      - client_id
+      - project_id
+    parallel_task: true
+    parallel_inputs:
+      - generate_embeddings
+    parallel_merge: true
+    queue: localAPI_queue
+
+  - step: save_mapping_to_document_db
+    pipeline_key: save_mapping_to_document_db
+    inputs:
+      - client_id
+      - project_id
+      - language
+      - generate_embeddings
+    parallel_task: true
+    parallel_inputs:
+      - generate_embeddings
+    parallel_merge: true
+    queue: localAPI_queue
+
+  # Final step: Pass through the results unchanged
+  - step: pass_through
+    pipeline_key: PassThrough
+    section_id: ingest_result
+    inputs:
+      - save_mapping_to_document_db
+    queue: localAPI_queue

@@ -255,7 +255,30 @@ Output:
 - Standardize location names (e.g., "San Francisco, California" not "SF, CA")""",
         "language": "English",
         "entities": "[]",
-        "relationships": "[]"
+        "relationships": "[]",
+        "entity_mappings": {
+            "Hassan University": "Hassan University 1st",
+            "CDG-DXC": "CDG",
+            "Faculty of Sciences Dhar El Mahraz": "Faculty of Sciences and Techniques, Mohammed IA",
+            "Apache Spark": "Spark",
+            "LLMs": "Machine Learning",
+            "IRIS Dataset Classification": "Statistical Analysis",
+            "MIT": "Massachusetts Institute of Technology",
+            "Stanford": "Stanford University",
+            "Google": "Google LLC",
+            "Microsoft": "Microsoft Corporation",
+            "AWS": "Amazon Web Services",
+            "JS": "JavaScript",
+            "React": "React.js",
+            "Node": "Node.js",
+            "ML": "Machine Learning",
+            "AI": "Artificial Intelligence",
+            "CS": "Computer Science",
+            "SWE": "Software Engineer",
+            "PM": "Project Manager",
+            "CEO": "Chief Executive Officer",
+            "CTO": "Chief Technology Officer"
+        }
     }
 }
 

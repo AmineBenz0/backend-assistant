@@ -1,23 +1,24 @@
 from typing import Any, Dict, Tuple, List, Optional
 import json
+import ast
 import os
 import logging
 import time
 import asyncio
 
 from libs.llm_service.gateway import LLMGateway
-from libs.preprocessing_service.helpers.text_unit_processor import TextUnitProcessor
-from libs.preprocessing_service.helpers.document_processor import DocumentProcessor
 from libs.promptStore_service import get_default_langfuse_prompt_manager
 import openai
 import json
-from libs.graph_builder_service.graph_builders.graphrag_builder import GraphRAGBuilder
 from libs.database_service.storage import MinIOStorageManager
 from libs.database_service.service import DatabaseService
-from libs.embeddings_service import EmbeddingGeneratorInterface, EntityEmbeddingGenerator
+from libs.database_service.store_results import get_store_results
+from libs.embeddings_service import EmbeddingGeneratorInterface
 from libs.memory_service.providers import Mem0Provider
 from libs.database_service.sql_db.providers import PgSQLProvider
-from libs.llm_service.utils import parse_llm_json_response, clean_cypher_query
+from libs.llm_service.utils import parse_llm_json_response, safe_literal_eval, flatten_dict
+from libs.chunking_service.service import ChunkingGeneratorInterface
+from libs.chunking_service.models import ChunkingConfig, ChunkingMethod
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ def get_input_hash(inputs: Dict[str, Any], project_name: str, prompt_config_src:
 
 
 class ParseDocuments:
-    def __init__(self, inputs, project_name, prompt_config_src, pipeline_key):
+    def __init__(self, inputs, project_name, prompt_config, pipeline_key):
         self.inputs = inputs
 
     def execute(self) -> List[Dict[str, Any]]:
@@ -162,7 +163,7 @@ class ParseDocuments:
 
 
 class GetFiles:
-    def __init__(self, inputs, project_name, prompt_config_src, pipeline_key):
+    def __init__(self, inputs, project_name, prompt_config, pipeline_key):
         self.inputs = inputs
 
     def execute(self) -> List[Dict[str, Any]]:
@@ -375,14 +376,14 @@ class GetFiles:
 class ChunkDocuments:
     """Split documents into smaller chunks for processing"""
     
-    def __init__(self, inputs: Dict[str, Any], project_name: str, prompt_config_src: str, pipeline_key: str):
+    def __init__(self, inputs: Dict[str, Any], project_name: str, prompt_config: Dict[str, Any], pipeline_key: str):
         self.inputs = inputs
         self.project_name = project_name
-        self.prompt_config_src = prompt_config_src
+        self.prompt_config = prompt_config
         self.pipeline_key = pipeline_key
 
     def execute(self) -> List[Dict[str, Any]]:
-        """Split parsed documents into chunks"""
+        """Split parsed documents into chunks with consistent SHA256-based chunk_ids"""
         parsed_documents = self.inputs.get("parse_documents", [])
         
         if not parsed_documents:
@@ -393,6 +394,12 @@ class ChunkDocuments:
         
         # Convert to DocumentChunk format for processing
         from libs.preprocessing_service.models import DocumentChunk, DocumentMetadata, DocumentFormat
+        import hashlib
+        
+        # Get client_id, project_id, and language for consistent hashing
+        client_id = self.inputs.get("client_id", "default")
+        project_id = self.inputs.get("project_id", "default")
+        language = self.inputs.get("language", "en")
         
         chunks = []
         for i, doc in enumerate(parsed_documents):
@@ -400,8 +407,12 @@ class ChunkDocuments:
                 content = doc.get("text", "")
                 file_id = doc.get("file_id", f"file_{i}")
                 document_id = doc.get("document_id", f"doc_{i}")
-                file_name = doc.get("metadata", {}).get("file_path", f"doc_{i}.txt")
+                file_path = doc.get("metadata", {}).get("file_path")
+                file_name = doc.get("metadata", {}).get("file_name")
                 file_extension = doc.get("metadata", {}).get("file_extension", ".txt")
+                
+                # Use file_name as object_name for consistency with ChromaDB
+                object_name = file_name or file_path or f"doc_{i}"
                 
                 # Simple chunking - split by paragraphs or sentences
                 # In a real implementation, you'd use more sophisticated chunking
@@ -410,11 +421,15 @@ class ChunkDocuments:
                 
                 for chunk_idx, chunk_text in enumerate(text_chunks):
                     if chunk_text.strip():  # Skip empty chunks
-                        chunk_id = f"{file_id}_chunk_{chunk_idx}"
+                        # Generate deterministic SHA256 hash-based chunk_id
+                        # This MUST match the logic in ChromaDB storage
+                        # Include language for multi-language support
+                        raw_id = f"{language}_{client_id}_{project_id}_{object_name}_{chunk_text}"
+                        chunk_id = hashlib.sha256(raw_id.encode("utf-8")).hexdigest()
                         
                         metadata = DocumentMetadata(
                             file_name=file_name,
-                            file_path=file_name,
+                            file_path=file_path,
                             file_size=len(chunk_text.encode('utf-8')),
                             format=DocumentFormat.TXT
                         )
@@ -429,1002 +444,31 @@ class ChunkDocuments:
                         )
                         
                         chunks.append({
-                            "chunk_id": chunk_id,
+                            "chunk_id": chunk_id,  # SHA256 hash
                             "file_id": file_id,
                             "document_id": document_id,
                             "text": chunk_text,
+                            "object_name": object_name,  # Add object_name for consistency
                             "metadata": {
                                 "file_id": file_id,
-                                "file_path": file_name,
+                                "file_path": file_path,
+                                "file_name": file_name,
+                                "object_name": object_name,
                                 "file_extension": file_extension,
                                 "chunk_index": chunk_idx,
                                 "parent_doc_id": document_id,
-                                "parent_file_id": file_id
+                                "parent_file_id": file_id,
+                                "client_id": client_id,
+                                "project_id": project_id,
+                                "language": language
                             },
                             "document_chunk": document_chunk.model_dump(mode='json')  # Serialize to dict with JSON-compatible types
                         })
         
-        logger.info(f"Created {len(chunks)} chunks from {len(parsed_documents)} documents with proper file IDs")
+        logger.info(f"Created {len(chunks)} chunks from {len(parsed_documents)} documents with SHA256 chunk_ids")
+        if chunks:
+            logger.info(f"Sample chunk_id: {chunks[0]['chunk_id']}")
         return chunks
-
-
-class BuildGraphFromChunks:
-    """Build the complete graph from document chunks using GraphRAGBuilder directly"""
-    
-    def __init__(self, inputs: Dict[str, Any], project_name: str, prompt_config_src: str, pipeline_key: str):
-        self.inputs = inputs
-        self.project_name = project_name
-        self.prompt_config_src = prompt_config_src
-        self.pipeline_key = pipeline_key
-
-    def execute(self) -> Dict[str, Any]:
-        """Build graph using GraphRAGBuilder directly from chunks"""
-        logger.info("🚀 Starting Graph Building from Chunks")
-        
-        # Run the async execution in a new event loop
-        import asyncio
-        return asyncio.run(self._execute_async())
-    
-    async def _execute_async(self) -> Dict[str, Any]:
-        """Internal async execution method for chunk-based approach"""
-        
-        try:
-            # Get chunks from previous step
-            chunks_data = self.inputs.get("chunk_documents", [])
-            
-            if not chunks_data:
-                logger.error("No document chunks found for graph building")
-                return {"error": "No document chunks available", "total_entities": 0, "total_relationships": 0}
-            
-            logger.info(f"Building graph from {len(chunks_data)} chunks using GraphRAGBuilder")
-            
-            # Extract DocumentChunk objects from chunks
-            document_chunks = []
-            for chunk_data in chunks_data:
-                if "document_chunk" in chunk_data:
-                    # Reconstruct DocumentChunk from serialized dict
-                    chunk_dict = chunk_data["document_chunk"]
-                    if isinstance(chunk_dict, dict):
-                        # Import here to avoid circular imports
-                        from libs.preprocessing_service.models import DocumentChunk, DocumentMetadata
-                        
-                        # Reconstruct DocumentMetadata
-                        metadata_dict = chunk_dict.get("metadata", {})
-                        # Handle datetime strings from JSON serialization
-                        if "created_at" in metadata_dict and isinstance(metadata_dict["created_at"], str):
-                            from datetime import datetime
-                            metadata_dict["created_at"] = datetime.fromisoformat(metadata_dict["created_at"].replace('Z', '+00:00'))
-                        if "modified_at" in metadata_dict and isinstance(metadata_dict["modified_at"], str):
-                            from datetime import datetime
-                            metadata_dict["modified_at"] = datetime.fromisoformat(metadata_dict["modified_at"].replace('Z', '+00:00'))
-                        metadata = DocumentMetadata(**metadata_dict)
-                        
-                        # Reconstruct DocumentChunk
-                        document_chunk = DocumentChunk(
-                            chunk_id=chunk_dict["chunk_id"],
-                            text=chunk_dict["text"],
-                            metadata=metadata,
-                            chunk_index=chunk_dict["chunk_index"],
-                            start_char=chunk_dict["start_char"],
-                            end_char=chunk_dict["end_char"],
-                            embedding=chunk_dict.get("embedding")
-                        )
-                        document_chunks.append(document_chunk)
-                    else:
-                        # Already a DocumentChunk object (backward compatibility)
-                        document_chunks.append(chunk_dict)
-            
-            if not document_chunks:
-                logger.error("No valid DocumentChunk objects found")
-                return {"error": "No valid document chunks", "total_entities": 0, "total_relationships": 0}
-            
-            # Use GraphRAGBuilder directly to build graph from chunks
-            graph_result = await self._build_from_chunks(document_chunks)
-            
-            # Extract results from graph_result
-            if hasattr(graph_result, 'entities'):
-                entities = graph_result.entities
-                relationships = graph_result.relationships
-                total_communities = getattr(graph_result, 'total_communities', 0)
-                processing_time = getattr(graph_result, 'processing_time', 0)
-                graph_statistics = getattr(graph_result, 'graph_statistics', {})
-            else:
-                # Handle case where graph_result is a dict
-                entities = graph_result.get('entities', [])
-                relationships = graph_result.get('relationships', [])
-                total_communities = graph_result.get('total_communities', 0)
-                processing_time = graph_result.get('processing_time', 0)
-                graph_statistics = graph_result.get('graph_statistics', {})
-            
-            # Convert entities and relationships to dict format for compatibility
-            entities_dict = []
-            if entities:
-                for entity in entities:
-                    if hasattr(entity, 'model_dump'):
-                        entities_dict.append(entity.model_dump())
-                    else:
-                        entities_dict.append(entity)  # Already a dict
-            
-            relationships_dict = []
-            if relationships:
-                for rel in relationships:
-                    if hasattr(rel, 'model_dump'):
-                        relationships_dict.append(rel.model_dump())
-                    else:
-                        relationships_dict.append(rel)  # Already a dict
-            
-            # Store comprehensive results
-            job_id = f"graphrag_chunks_{int(time.time())}"
-            
-            return {
-                "job_id": job_id,
-                "entities": entities_dict,
-                "relationships": relationships_dict,
-                "total_entities": len(entities),
-                "total_relationships": len(relationships),
-                "total_communities": total_communities,
-                "processing_time": processing_time,
-                "status": "completed",
-                "pipeline_type": "graphrag_from_chunks",
-                "is_graph_built_successfully": True
-            }
-            
-        except Exception as e:
-            logger.error(f"Graph building from chunks failed: {e}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            
-            return {
-                "job_id": f"failed_graphrag_chunks_{int(time.time())}",
-                "total_entities": 0,
-                "total_relationships": 0,
-                "status": "failed",
-                "error": str(e),
-                "pipeline_type": "graphrag_from_chunks",
-                "is_graph_built_successfully": False
-            }
-    
-    async def _build_from_chunks(self, document_chunks):
-        """Build graph from document chunks using GraphRAGBuilder directly"""
-        # Initialize services
-        from libs.graph_builder_service import GraphBuilderInterface
-        from libs.embeddings_service import EmbeddingGeneratorInterface
-        from libs.database_service.service import DatabaseService
-        
-        graph_builder_service = GraphBuilderInterface()
-        embeddings_service = EmbeddingGeneratorInterface()
-        database_service = DatabaseService()
-        await database_service.initialize()
-        
-        # Use GraphRAGBuilder directly instead of orchestrator
-        graph_builder = graph_builder_service.get_builder(
-            "graphrag",
-            workspace_dir=f"/tmp/workflow_graphrag_{self.project_name}",
-            debug_output_dir=f"/tmp/workflow_graphrag_debug_{self.project_name}"
-        )
-        
-        logger.info("🚀 Executing GraphRAG pipeline using GraphRAGBuilder...")
-        
-        # Execute graph building directly
-        return await graph_builder.build_graph(documents=document_chunks)
-
-
-class BuildGraphFromExtracted:
-    """Build the complete graph from extracted entities and relationships"""
-    
-    def __init__(self, inputs: Dict[str, Any], project_name: str, prompt_config_src: str, pipeline_key: str):
-        self.inputs = inputs
-        self.project_name = project_name
-        self.prompt_config_src = prompt_config_src
-        self.pipeline_key = pipeline_key
-
-    def execute(self) -> Dict[str, Any]:
-        """Build graph using the 12-step GraphRAG orchestrator"""
-        logger.info("🚀 Starting Graph Building from Chunks")
-        
-        # Run the async execution in a new event loop
-        import asyncio
-        return asyncio.run(self._execute_async())
-    
-    async def _execute_async(self) -> Dict[str, Any]:
-        """Internal async execution method"""
-        
-        try:
-            # Get data from previous steps - can be chunks, entities, or relationships
-            logger.info(f"BuildGraphFromExtracted inputs keys: {list(self.inputs.keys())}")
-            chunks_data = self.inputs.get("chunk_documents", [])
-            entities_data = self.inputs.get("extract_entities", [])
-            relationships_data = self.inputs.get("extract_relationships", [])
-            communities_data = self.inputs.get("summarize_communities", [])
-            normalization_data = self.inputs.get("normalize_entities", {})
-            
-            logger.info(f"Data received - chunks: {len(chunks_data) if chunks_data else 0}, entities: {len(entities_data) if entities_data else 0}, relationships: {len(relationships_data) if relationships_data else 0}, communities: {len(communities_data) if communities_data else 0}, normalization: {type(normalization_data)}")
-            logger.info(f"Entity data type: {type(entities_data)}, Relationship data type: {type(relationships_data)}")
-            logger.info(f"Normalization data: {normalization_data}")
-            
-            # Parse GraphRAG responses if they are raw LLM responses
-            from libs.graph_builder_service import GraphRAGResponseParser
-            
-            # Parse entities if it's a raw string response
-            if entities_data and isinstance(entities_data, str):
-                logger.info("Parsing raw GraphRAG entities response")
-                entities_data = GraphRAGResponseParser.parse_entities_response(entities_data)
-            
-            # Parse relationships if it's a raw string response
-            if relationships_data and isinstance(relationships_data, str):
-                logger.info("Parsing raw GraphRAG relationships response")
-                relationships_data = GraphRAGResponseParser.parse_relationships_response(relationships_data)
-            
-            # Determine what data we have to work with
-            if chunks_data:
-                logger.info(f"Building graph from {len(chunks_data)} document chunks")
-                input_data = chunks_data
-                input_type = "chunks"
-            elif entities_data or relationships_data:
-                logger.info(f"Building graph from extracted entities ({len(entities_data) if entities_data else 0}) and relationships ({len(relationships_data) if relationships_data else 0})")
-                input_data = {"entities": entities_data, "relationships": relationships_data, "communities": communities_data}
-                input_type = "extracted_data"
-            else:
-                logger.error("No valid input data found for graph building")
-                return {"error": "No valid input data available", "total_entities": 0, "total_relationships": 0}
-            
-            logger.info(f"Building graph from {input_type}")
-            
-            if input_type == "chunks":
-                # Extract DocumentChunk objects from chunks
-                document_chunks = []
-                for chunk_data in input_data:
-                    if "document_chunk" in chunk_data:
-                        # Reconstruct DocumentChunk from serialized dict
-                        chunk_dict = chunk_data["document_chunk"]
-                        if isinstance(chunk_dict, dict):
-                            # Import here to avoid circular imports
-                            from libs.preprocessing_service.models import DocumentChunk, DocumentMetadata
-                            
-                            # Reconstruct DocumentMetadata
-                            metadata_dict = chunk_dict.get("metadata", {})
-                            # Handle datetime strings from JSON serialization
-                            if "created_at" in metadata_dict and isinstance(metadata_dict["created_at"], str):
-                                from datetime import datetime
-                                metadata_dict["created_at"] = datetime.fromisoformat(metadata_dict["created_at"].replace('Z', '+00:00'))
-                            if "modified_at" in metadata_dict and isinstance(metadata_dict["modified_at"], str):
-                                from datetime import datetime
-                                metadata_dict["modified_at"] = datetime.fromisoformat(metadata_dict["modified_at"].replace('Z', '+00:00'))
-                            metadata = DocumentMetadata(**metadata_dict)
-                            
-                            # Reconstruct DocumentChunk
-                            document_chunk = DocumentChunk(
-                                chunk_id=chunk_dict["chunk_id"],
-                                text=chunk_dict["text"],
-                                metadata=metadata,
-                                chunk_index=chunk_dict["chunk_index"],
-                                start_char=chunk_dict["start_char"],
-                                end_char=chunk_dict["end_char"],
-                                embedding=chunk_dict.get("embedding")
-                            )
-                            document_chunks.append(document_chunk)
-                        else:
-                            # Already a DocumentChunk object (backward compatibility)
-                            document_chunks.append(chunk_dict)
-                
-                if not document_chunks:
-                    logger.error("No valid DocumentChunk objects found")
-                    return {"error": "No valid document chunks", "total_entities": 0, "total_relationships": 0}
-                
-                # Use the orchestrator to build graph from chunks
-                graph_result = await self._build_from_chunks(document_chunks)
-                
-            elif input_type == "extracted_data":
-                # Build graph from already extracted entities and relationships
-                # Pass normalization data to the build method
-                input_data['normalize_entities'] = normalization_data
-                graph_result = await self._build_from_extracted_data(input_data)
-            
-            else:
-                logger.error(f"Unknown input type: {input_type}")
-                return {"error": f"Unknown input type: {input_type}", "total_entities": 0, "total_relationships": 0}
-            
-            # Extract results from graph_result
-            if hasattr(graph_result, 'entities'):
-                entities = graph_result.entities
-                relationships = graph_result.relationships
-                total_communities = getattr(graph_result, 'total_communities', 0)
-                processing_time = getattr(graph_result, 'processing_time', 0)
-                graph_statistics = getattr(graph_result, 'graph_statistics', {})
-            else:
-                # Handle case where graph_result is a dict
-                entities = graph_result.get('entities', [])
-                relationships = graph_result.get('relationships', [])
-                total_communities = graph_result.get('total_communities', 0)
-                processing_time = graph_result.get('processing_time', 0)
-                graph_statistics = graph_result.get('graph_statistics', {})
-            
-            logger.info(f"✅ GraphRAG Pipeline Results:")
-            logger.info(f"   - Total entities: {len(entities)}")
-            logger.info(f"   - Total relationships: {len(relationships)}")
-            logger.info(f"   - Total communities: {total_communities}")
-            
-            # Convert entities and relationships to dict format for compatibility
-            entities_dict = []
-            if entities:
-                for entity in entities:
-                    if hasattr(entity, 'model_dump'):
-                        entities_dict.append(entity.model_dump())
-                    else:
-                        entities_dict.append(entity)  # Already a dict
-            
-            relationships_dict = []
-            if relationships:
-                for rel in relationships:
-                    if hasattr(rel, 'model_dump'):
-                        relationships_dict.append(rel.model_dump())
-                    else:
-                        relationships_dict.append(rel)  # Already a dict
-            
-            # Initialize database service
-            from libs.database_service.service import DatabaseService
-            database_service = DatabaseService()
-            await database_service.initialize()
-            
-            # Store comprehensive results
-            job_id = f"graphrag_{int(time.time())}"
-            await database_service.storage_manager.store_graph_output(
-                job_id,
-                {
-                    "entities": entities_dict,
-                    "relationships": relationships_dict,
-                    "graph_summary": graph_result.model_dump() if hasattr(graph_result, 'model_dump') else graph_result,
-                    "pipeline_metadata": graph_statistics,
-                    "communities": getattr(graph_result, 'communities', []) if hasattr(graph_result, 'communities') else [],
-                    "statistics": graph_statistics.get("statistics", {}) if isinstance(graph_statistics, dict) else {}
-                },
-                {
-                    "total_entities": len(entities),
-                    "total_relationships": len(relationships),
-                    "total_communities": total_communities,
-                    "processing_time": processing_time,
-                    "pipeline_type": "graphrag_orchestrator",
-                    "pipeline_id": graph_statistics.get("pipeline_id") if isinstance(graph_statistics, dict) else None,
-                    "steps_completed": 12
-                }
-            )
-            
-            return {
-                "job_id": job_id,
-                "entities": entities_dict,
-                "relationships": relationships_dict,
-                "total_entities": len(entities),
-                "total_relationships": len(relationships),
-                "total_communities": total_communities,
-                "processing_time": processing_time,
-                "status": "completed",
-                "pipeline_type": "graphrag_orchestrator",
-                "is_graph_built_successfully": True
-            }
-            
-        except Exception as e:
-            logger.error(f"Graph building failed: {e}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            
-            return {
-                "job_id": f"failed_graphrag_{int(time.time())}",
-                "total_entities": 0,
-                "total_relationships": 0,
-                "status": "failed",
-                "error": str(e),
-                "pipeline_type": "graphrag_orchestrator",
-                "is_graph_built_successfully": False
-            }
-    
-    async def _build_from_chunks(self, document_chunks):
-        """Build graph from document chunks using the orchestrator"""
-        # Initialize services
-        from libs.graph_builder_service import GraphBuilderInterface
-        from libs.embeddings_service import EmbeddingGeneratorInterface
-        from libs.database_service.service import DatabaseService
-        
-        graph_builder_service = GraphBuilderInterface()
-        embeddings_service = EmbeddingGeneratorInterface()
-        database_service = DatabaseService()
-        await database_service.initialize()
-        
-        # Use GraphRAGBuilder directly instead of orchestrator
-        graph_builder = graph_builder_service.get_builder(
-            "graphrag",
-            workspace_dir=f"/tmp/workflow_graphrag_{self.project_name}",
-            debug_output_dir=f"/tmp/workflow_graphrag_debug_{self.project_name}"
-        )
-        
-        logger.info("🚀 Executing GraphRAG pipeline using GraphRAGBuilder...")
-        
-        # Execute graph building directly
-        return await graph_builder.build_graph(documents=document_chunks)
-    
-    async def _build_from_extracted_data(self, extracted_data):
-        """Build graph from already extracted entities and relationships"""
-        logger.info("Building graph from pre-extracted entities and relationships")
-        
-        entities_data = extracted_data.get('entities', [])
-        relationships_data = extracted_data.get('relationships', [])
-        communities_data = extracted_data.get('communities', [])
-        normalization_data = extracted_data.get('normalize_entities', {})
-        
-        # Apply entity normalization if available
-        if normalization_data and isinstance(normalization_data, dict):
-            entity_mappings = normalization_data.get('entity_mappings', {})
-            normalized_entities = normalization_data.get('normalized_entities', [])
-            
-            if entity_mappings:
-                logger.info(f"Applying entity normalization with {len(entity_mappings)} mappings")
-                
-                # Use normalized entities if available, otherwise use original entities
-                if normalized_entities:
-                    entities_data = normalized_entities
-                    logger.info(f"Using {len(normalized_entities)} normalized entities")
-                
-                # Apply entity name mappings to relationships
-                updated_relationships = []
-                for rel in relationships_data:
-                    if isinstance(rel, dict):
-                        source_entity = rel.get('source_entity', '')
-                        target_entity = rel.get('target_entity', '')
-                        
-                        # Apply mappings
-                        mapped_source = entity_mappings.get(source_entity, source_entity)
-                        mapped_target = entity_mappings.get(target_entity, target_entity)
-                        
-                        # Update relationship with mapped entity names
-                        updated_rel = rel.copy()
-                        updated_rel['source_entity'] = mapped_source
-                        updated_rel['target_entity'] = mapped_target
-                        updated_relationships.append(updated_rel)
-                    else:
-                        updated_relationships.append(rel)
-                
-                relationships_data = updated_relationships
-                logger.info(f"Applied normalization to {len(relationships_data)} relationships")
-            else:
-                logger.info("No entity mappings found in normalization data")
-        else:
-            logger.info("No normalization data available, using original entities and relationships")
-        
-        # Convert the extracted data into a graph result format
-        # This is a simplified approach - in a real implementation you might want
-        # to use a proper graph construction service
-        
-        # For now, return the data in the expected format
-        import time
-        from types import SimpleNamespace
-        
-        # Create a mock graph result object
-        graph_result = SimpleNamespace()
-        graph_result.entities = entities_data
-        graph_result.relationships = relationships_data
-        graph_result.total_communities = len(communities_data) if communities_data else 0
-        graph_result.processing_time = 0.1  # Minimal processing time since data is pre-extracted
-        graph_result.graph_statistics = {
-            "pipeline_id": f"extracted_data_{int(time.time())}",
-            "statistics": {
-                "total_entities": len(entities_data),
-                "total_relationships": len(relationships_data),
-                "total_communities": len(communities_data) if communities_data else 0
-            }
-        }
-        
-        logger.info(f"Built graph from extracted data: {len(entities_data)} entities, {len(relationships_data)} relationships")
-        return graph_result
-
-
-class StoreGraphToNeo4j:
-    """Store the built graph to Neo4j database"""
-    
-    def __init__(self, inputs: Dict[str, Any], project_name: str, prompt_config_src: str, pipeline_key: str):
-        self.inputs = inputs
-        self.project_name = project_name
-        self.prompt_config_src = prompt_config_src
-        self.pipeline_key = pipeline_key
-
-    def _normalize_entity_name(self, entity_name: str) -> str:
-        """
-        Normalize entity name to create consistent node IDs for Neo4j
-        
-        This function ensures that entity names are consistently converted to node IDs
-        both when creating nodes and when creating relationships.
-        """
-        import re
-        
-        # Apply entity name mappings to handle inconsistencies between extraction steps
-        entity_mappings = {
-            "Hassan University": "Hassan University 1st",
-            "CDG-DXC": "CDG",
-            "Faculty of Sciences Dhar El Mahraz": "Faculty of Sciences and Techniques, Mohammed IA",
-            "Apache Spark": "Spark",
-            "LLMs": "Machine Learning",  # Map to existing ML concept
-            "IRIS Dataset Classification": "Statistical Analysis",  # Map to existing skill
-        }
-        
-        # Apply mapping if entity name matches
-        mapped_name = entity_mappings.get(entity_name, entity_name)
-        
-        # Convert to uppercase and replace spaces, hyphens, and other special characters
-        normalized = mapped_name.upper()
-        
-        # Replace spaces and hyphens with underscores
-        normalized = normalized.replace(' ', '_').replace('-', '_')
-        
-        # Replace other special characters with underscores
-        normalized = re.sub(r'[^A-Z0-9_]', '_', normalized)
-        
-        # Remove multiple consecutive underscores
-        normalized = re.sub(r'_+', '_', normalized)
-        
-        # Remove leading/trailing underscores
-        normalized = normalized.strip('_')
-        
-        return normalized
-
-    def execute(self) -> Dict[str, Any]:
-        """Store graph data to Neo4j"""
-        logger.info("🚀 Starting Neo4j Storage")
-        
-        # Run the async execution in a new event loop
-        import asyncio
-        return asyncio.run(self._execute_async())
-    
-    async def _execute_async(self) -> Dict[str, Any]:
-        """Internal async execution method"""
-        
-        try:
-            # Get graph data from previous step (can be from chunks or extracted approach)
-            graph_data = self.inputs.get("build_graph_from_extracted", {})
-            if not graph_data:
-                graph_data = self.inputs.get("build_graph_from_chunks", {})
-            
-            if not graph_data or graph_data.get("status") == "failed":
-                logger.error("No valid graph data found for Neo4j storage")
-                return {"error": "No valid graph data", "neo4j_stored": False}
-            
-            entities_dict = graph_data.get("entities", [])
-            relationships_dict = graph_data.get("relationships", [])
-            job_id = graph_data.get("job_id", f"neo4j_store_{int(time.time())}")
-            
-            if not entities_dict and not relationships_dict:
-                logger.warning("No entities or relationships to store")
-                return {"neo4j_stored": True, "nodes_stored": 0, "relationships_stored": 0}
-            
-            # Initialize database service
-            from libs.database_service.service import DatabaseService
-            from libs.database_service.models import GraphNode, GraphRelationship
-            
-            database_service = DatabaseService()
-            await database_service.initialize()
-            
-            # Convert entities to GraphNode objects
-            neo4j_nodes = []
-            for entity_dict in entities_dict:
-                try:
-                    # Handle the actual entity structure from extract_entities
-                    entity_name = entity_dict.get('name', 'Unknown')
-                    entity_type = entity_dict.get('type', 'ENTITY')
-                    entity_description = entity_dict.get('description', '')
-                    
-                    # Use entity name as node_id (cleaned for Neo4j)
-                    node_id = self._normalize_entity_name(entity_name)
-                    
-                    node_properties = {
-                        "description": entity_description,
-                        "source": "graphrag_pipeline",
-                        "entity_type": entity_type
-                    }
-                    
-                    node = GraphNode(
-                        node_id=node_id,
-                        index_id=job_id,
-                        labels=[entity_type],
-                        name=entity_name,
-                        node_type=entity_type,
-                        properties=node_properties
-                    )
-                    neo4j_nodes.append(node)
-                    
-                except Exception as e:
-                    logger.warning(f"Failed to convert entity to GraphNode: {e}")
-                    logger.warning(f"Entity data: {entity_dict}")
-                    continue
-            
-            # Convert relationships to GraphRelationship objects
-            neo4j_relationships = []
-            for rel_dict in relationships_dict:
-                try:
-                    # Handle the actual relationship structure from extract_relationships
-                    source_entity = rel_dict.get('source_entity', rel_dict.get('source', ''))
-                    target_entity = rel_dict.get('target_entity', rel_dict.get('target', ''))
-                    # Use the relationship_type field for the actual relationship type
-                    rel_type = rel_dict.get('relationship_type', 'RELATED_TO')
-                    rel_description = rel_dict.get('description', '')
-                    rel_strength = rel_dict.get('relationship_strength', rel_dict.get('weight', 1.0))
-                    
-                    # Clean node IDs to match what we used for nodes
-                    source_node_id = self._normalize_entity_name(source_entity)
-                    target_node_id = self._normalize_entity_name(target_entity)
-                    
-                    relationship = GraphRelationship(
-                        index_id=job_id,
-                        source_node_id=source_node_id,
-                        target_node_id=target_node_id,
-                        relationship_type=rel_type,
-                        properties={
-                            "source": "graphrag_pipeline",
-                            "description": rel_description,
-                            "weight": float(rel_strength),
-                            "source_entity": source_entity,
-                            "target_entity": target_entity
-                        },
-                        weight=float(rel_strength),
-                        bidirectional=rel_dict.get('bidirectional', False)
-                    )
-                    neo4j_relationships.append(relationship)
-                    
-                except Exception as e:
-                    logger.warning(f"Failed to convert relationship to GraphRelationship: {e}")
-                    logger.warning(f"Relationship data: {rel_dict}")
-                    continue
-            
-            # Store to Neo4j
-            nodes_result = None
-            rels_result = None
-            
-            if neo4j_nodes:
-                nodes_result = await database_service.add_nodes(job_id, neo4j_nodes)
-                logger.info(f"Stored {len(neo4j_nodes)} nodes to Neo4j")
-            
-            if neo4j_relationships:
-                rels_result = await database_service.add_relationships(job_id, neo4j_relationships)
-                logger.info(f"Stored {len(neo4j_relationships)} relationships to Neo4j")
-            
-            return {
-                "neo4j_stored": True,
-                "nodes_stored": len(neo4j_nodes),
-                "relationships_stored": len(neo4j_relationships),
-                "job_id": job_id,
-                "nodes_result": nodes_result,
-                "relationships_result": rels_result
-            }
-            
-        except Exception as e:
-            logger.error(f"Neo4j storage failed: {e}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            
-            return {
-                "neo4j_stored": False,
-                "error": str(e),
-                "nodes_stored": 0,
-                "relationships_stored": 0
-            }
-
-
-class ExecuteFullGraphRAGPipeline:
-    """Legacy wrapper - now delegates to the split pipeline steps"""
-    
-    def __init__(self, inputs: Dict[str, Any], project_name: str, prompt_config_src: str, pipeline_key: str):
-        self.inputs = inputs
-        self.project_name = project_name
-        self.prompt_config_src = prompt_config_src
-        self.pipeline_key = pipeline_key
-
-    def execute(self) -> Dict[str, Any]:
-        """
-        Legacy wrapper that delegates to the new split pipeline steps.
-        This maintains backward compatibility while using the new modular approach.
-        """
-        logger.info("🚀 Starting Full GraphRAG Pipeline Execution (Legacy Wrapper)")
-        
-        try:
-            # Step 1: Chunk documents
-            logger.info("Step 1: Chunking documents")
-            chunk_step = ChunkDocuments(self.inputs, self.project_name, self.prompt_config_src, "chunk_documents")
-            chunks_result = chunk_step.execute()
-            
-            # Step 2: Build graph from chunks
-            logger.info("Step 2: Building graph from chunks")
-            build_inputs = {"chunk_documents": chunks_result}
-            build_step = BuildGraphFromChunks(build_inputs, self.project_name, self.prompt_config_src, "build_graph_from_chunks")
-            graph_result = build_step.execute()
-            
-            # Step 3: Store to Neo4j
-            logger.info("Step 3: Storing graph to Neo4j")
-            store_inputs = {"build_graph_from_chunks": graph_result}
-            store_step = StoreGraphToNeo4j(store_inputs, self.project_name, self.prompt_config_src, "store_graph_to_neo4j")
-            neo4j_result = store_step.execute()
-            
-            # Combine results for backward compatibility
-            final_result = {
-                **graph_result,
-                "neo4j_storage": neo4j_result,
-                "pipeline_type": "full_graphrag_legacy_wrapper"
-            }
-            
-            logger.info("✅ Full GraphRAG Pipeline completed successfully")
-            return final_result
-            
-        except Exception as e:
-            logger.error(f"Full GraphRAG pipeline execution failed: {e}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            
-            return {
-                "job_id": f"failed_graphrag_{int(time.time())}",
-                "total_entities": 0,
-                "total_relationships": 0,
-                "status": "failed",
-                "error": str(e),
-                "pipeline_type": "full_graphrag_legacy_wrapper",
-                "is_graph_built_successfully": False
-            }
-
-
-
-class PrepareNodesDescriptionForEmbeddings:
-    """Prepare entity IDs and descriptions for embedding generation by querying Neo4j directly"""
-    
-    def __init__(self, inputs: Dict[str, Any], project_name: str, prompt_config_src: str, pipeline_key: str):
-        self.inputs = inputs
-
-    def execute(self) -> List[Dict[str, Any]]:
-        """Query Neo4j to get nodes with descriptions if graph was stored successfully"""
-        
-        # Check if graph storage was successful
-        storage_output = self.inputs.get("store_graph_to_neo4j", {})
-        is_graph_stored_successfully = storage_output.get("neo4j_stored", False)
-        
-        if not is_graph_stored_successfully:
-            logger.warning("Graph was not stored successfully, skipping embedding preparation")
-            return []
-        
-        logger.info("Graph stored successfully, querying Neo4j for nodes with descriptions...")
-        
-        try:
-            from libs.database_service.service import DatabaseService
-            import asyncio
-            
-            database_service = DatabaseService()
-            asyncio.run(database_service.initialize())
-            
-            # Query Neo4j for all nodes that have descriptions but no embeddings
-            prepared_nodes = []
-            
-            with database_service.graph_manager._driver.session(database="neo4j") as session:
-                # Get nodes that have descriptions but no description_embedding
-                result = session.run("""
-                    MATCH (n)
-                    WHERE n.description IS NOT NULL 
-                    AND n.description <> ""
-                    AND n.description_embedding IS NULL
-                    RETURN n.node_id as entity_id, 
-                           n.name as name, 
-                           n.node_type as type, 
-                           n.description as description,
-                           properties(n) as properties
-                    LIMIT 1000
-                """)
-                
-                for record in result:
-                    entity_dict = {
-                        "entity_id": record["entity_id"],
-                        "name": record["name"] or "",
-                        "type": record["type"] or "ENTITY",
-                        "description": record["description"] or "",
-                        "properties": record["properties"] or {}
-                    }
-                    prepared_nodes.append(entity_dict)
-                    
-            logger.info(f"Found {len(prepared_nodes)} nodes in Neo4j that need embeddings")
-            
-            # Log sample of what we found
-            if prepared_nodes:
-                sample = prepared_nodes[0]
-                logger.info(f"Sample node: {sample['name']} ({sample['entity_id']}) - Description: {sample['description'][:100]}...")
-            
-            return prepared_nodes
-            
-        except Exception as e:
-            logger.error(f"Error querying Neo4j for nodes: {e}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            
-            # If Neo4j query fails but graph was built successfully, return empty list
-            # The graph building step should have logged the actual error
-            logger.error("Failed to query Neo4j even though graph was built successfully")
-            return []
-
-
-class GenerateEntityEmbeddings:
-    def __init__(self, inputs: Dict[str, Any], project_name: str, prompt_config_src: str, pipeline_key: str):
-        self.inputs = inputs
-
-    def execute(self) -> List[Dict[str, Any]]:
-        # Get prepared entities from prepare_nodes_description step
-        entities = self.inputs.get("prepare_nodes_description", [])
-        
-        if not entities:
-            logger.warning("No prepared entities found for embedding generation")
-            return []
-        
-        logger.info(f"Generating embeddings for {len(entities)} entities")
-        
-        try:
-            # Initialize entity embedding generator
-            entity_embedder = EntityEmbeddingGenerator(
-                model="text-embedding-3-large",
-                batch_size=50
-            )
-            
-            # Entities are already in the correct format from prepare_nodes_description
-            if not entities:
-                logger.warning("No valid entities to process for embeddings")
-                return []
-            
-            # Generate embeddings in batches
-            import asyncio
-            entity_embeddings = asyncio.run(entity_embedder.batch_generate_entity_embeddings(
-                entities,
-                include_descriptions=True,
-                include_properties=False  # Keep embeddings focused on name and description
-            ))
-            
-            # Create mapping of entity_id to embedding
-            embedding_map = {emb.entity_id: emb.embedding for emb in entity_embeddings}
-            
-            # Add embeddings to entity properties
-            enhanced_entities = []
-            for i, entity in enumerate(entities):
-                if isinstance(entity, dict):
-                    enhanced_properties = entity.get("properties", {}).copy()
-                    entity_id = entity.get("entity_id", f"entity_{i}")
-                    
-                    if entity_id in embedding_map:
-                        enhanced_properties["description_embedding"] = embedding_map[entity_id]
-                        enhanced_properties["embedding_model"] = "text-embedding-3-large"
-                        enhanced_properties["embedding_dimension"] = len(embedding_map[entity_id])
-                        enhanced_properties["has_embedding"] = True
-                        
-                        logger.info(f"Added description_embedding to entity {entity.get('name', entity_id)}: {len(embedding_map[entity_id])} dimensions")
-                    else:
-                        enhanced_properties["has_embedding"] = False
-                        logger.warning(f"No embedding found for entity {entity.get('name', entity_id)}")
-                    
-                    enhanced_entity = entity.copy()
-                    enhanced_entity["properties"] = enhanced_properties
-                    enhanced_entities.append(enhanced_entity)
-                else:
-                    # Handle non-dict entities
-                    enhanced_entities.append({
-                        "entity_id": f"entity_{i}",
-                        "name": str(entity),
-                        "type": "unknown",
-                        "description": "",
-                        "properties": {"has_embedding": False}
-                    })
-            
-            embedded_count = sum(1 for e in enhanced_entities if e.get("properties", {}).get("has_embedding", False))
-            logger.info(f"Successfully generated embeddings for {embedded_count}/{len(enhanced_entities)} entities")
-            
-            return enhanced_entities
-            
-        except Exception as e:
-            logger.error(f"Error generating entity embeddings: {e}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            
-            # Return fallback entities to prevent task from getting stuck
-            fallback_entities = []
-            for i, entity in enumerate(entities):
-                if isinstance(entity, dict):
-                    fallback_entities.append({
-                        **entity,
-                        "properties": {
-                            **entity.get("properties", {}),
-                            "has_embedding": False,
-                            "processing_method": "fallback"
-                        }
-                    })
-                else:
-                    fallback_entities.append({
-                        "entity_id": f"fallback_entity_{i}",
-                        "name": str(entity),
-                        "type": "unknown",
-                        "description": "",
-                        "properties": {"has_embedding": False, "processing_method": "fallback"}
-                    })
-            
-            logger.warning(f"Using fallback entity embeddings: {len(fallback_entities)} entities created")
-            return fallback_entities
-
-
-class UpdateNeo4jNodesWithEmbeddings:
-    """Update Neo4j nodes with description embeddings"""
-    
-    def __init__(self, inputs: Dict[str, Any], project_name: str, prompt_config_src: str, pipeline_key: str):
-        self.inputs = inputs
-
-    def execute(self) -> Dict[str, Any]:
-        """Update Neo4j nodes with the generated embeddings"""
-        
-        # Get embeddings from entities_embeddings step
-        entity_embeddings = self.inputs.get("entities_embeddings", [])
-        
-        if not entity_embeddings:
-            logger.warning("No entity embeddings found for Neo4j update")
-            return {"status": "skipped", "updated_nodes": 0}
-        
-        logger.info(f"Updating Neo4j nodes with embeddings for {len(entity_embeddings)} entities")
-        
-        try:
-            from libs.database_service.service import DatabaseService
-            import asyncio
-            import time
-            
-            database_service = DatabaseService()
-            asyncio.run(database_service.initialize())
-            
-            # Update each node with its embedding
-            updated_count = 0
-            job_id = f"entity_embeddings_update_{int(time.time())}"
-            
-            with database_service.graph_manager._driver.session(database="neo4j") as session:
-                for entity in entity_embeddings:
-                    if isinstance(entity, dict) and entity.get("entity_id"):
-                        entity_id = entity["entity_id"]
-                        properties = entity.get("properties", {})
-                        
-                        # Check if embedding exists
-                        if "description_embedding" in properties:
-                            embedding = properties["description_embedding"]
-                            
-                            # Update the node in Neo4j
-                            result = session.run("""
-                                MATCH (n {node_id: $entity_id})
-                                SET n.description_embedding = $embedding,
-                                    n.embedding_dimension = $dimension,
-                                    n.embedding_updated_at = datetime()
-                                RETURN n.name as name, n.node_id as node_id
-                            """, {
-                                "entity_id": entity_id,
-                                "embedding": embedding,
-                                "dimension": len(embedding) if embedding else 0
-                            })
-                            
-                            record = result.single()
-                            if record:
-                                updated_count += 1
-                                logger.info(f"Updated node '{record['name']}' ({record['node_id']}) with {len(embedding)}-dimensional embedding")
-                            else:
-                                logger.warning(f"Node with entity_id '{entity_id}' not found in Neo4j")
-                        else:
-                            logger.warning(f"Entity {entity_id} has no description_embedding")
-            
-            logger.info(f"Successfully updated {updated_count} nodes in Neo4j with embeddings")
-            
-            return {
-                "status": "completed",
-                "updated_nodes": updated_count,
-                "job_id": job_id,
-                "total_processed": len(entity_embeddings)
-            }
-            
-        except Exception as e:
-            logger.error(f"Error updating Neo4j nodes with embeddings: {e}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            
-            return {
-                "status": "failed",
-                "error": str(e),
-                "updated_nodes": 0
-            }
-
 
 class UploadToObjectStorage:
     """Upload file content to object storage (MinIO)"""
@@ -1436,7 +480,7 @@ class UploadToObjectStorage:
         self.pipeline_key = pipeline_key
 
     def execute(self) -> Dict[str, Any]:
-        """Execute the full GraphRAG pipeline using the orchestrator"""
+        """Execute the full Vector RAG pipeline using the orchestrator"""
         logger.info("🚀 Starting Full Preprocessing Pipeline Execution")
         
         # Run the async execution in a new event loop
@@ -1600,8 +644,8 @@ class ParseDocumentToMarkdown:
 
 
 
-class ChunkDocumentForRAG:
-    """Chunk parsed document for RAG processing"""
+class ChunkDocument:
+    """Chunk parsed document for RAG processing using Chonkie chunkers"""
     
     def __init__(self, inputs, project_name, prompt_config_src, pipeline_key):
         self.inputs = inputs
@@ -1619,26 +663,23 @@ class ChunkDocumentForRAG:
             # Get chunking parameters from initial inputs (always available)
             chunk_size = self.inputs.get("chunk_size", 1000)
             chunk_overlap = self.inputs.get("chunk_overlap", 200)
-            enable_chunking = self.inputs.get("enable_chunking", True)
             
             markdown_content = parse_result.get("markdown_content", "")
             filename = parse_result.get("filename", "unknown")
             
-            if not enable_chunking or not markdown_content:
-                logger.info(f"Chunking disabled or no content for {filename}")
+            if not markdown_content:
+                logger.info(f"No content to chunk for {filename}")
                 return {
                     "chunks": [],
                     "chunking_metadata": {
                         "total_chunks": 0,
                         "chunk_size": chunk_size,
                         "chunk_overlap": chunk_overlap,
-                        "enabled": enable_chunking
+                        "chunking_method": "none"
                     },
                     "parse_result": parse_result
                 }
-            
-            # Direct synchronous chunking - much simpler!
-            
+                        
             # Create document metadata
             document_metadata = {
                 "filename": filename,
@@ -1646,24 +687,41 @@ class ChunkDocumentForRAG:
                 "content_type": parse_result.get("content_type", "text/plain")
             }
             
-            # Chunk the document using direct synchronous call
-            # Since recursive text splitter is synchronous, we can call it directly
-            from libs.chunking_service.chunking_generators.recursive_text_splitter import RecursiveTextSplitterGenerator
-            from libs.chunking_service.models import ChunkingConfig, ChunkingMethod
+            # Get chunking method from inputs (default to token_chunker)
+            logger.info("⚙️  Getting chunking parameters from inputs...")
+            chunking_method = self.inputs.get("chunking_method", "token_chunker")
+            embeddings_provider = self.inputs.get("embedding_provider", "azure_openai")
+            embeddings_model = self.inputs.get("embedding_model", "text-embedding-3-large")
+            
+            logger.info(f"📋 Chunking configuration:")
+            logger.info(f"  - Method: {chunking_method}")
+            logger.info(f"  - Provider: {embeddings_provider}")
+            logger.info(f"  - Model: {embeddings_model}")
+            logger.info(f"  - Chunk size: {chunk_size}")
+            logger.info(f"  - Chunk overlap: {chunk_overlap}")
+            logger.info(f"  - Content size: {len(markdown_content)} characters")
             
             # Create chunking config
+            logger.info("🔧 Creating ChunkingConfig object...")
             chunking_config = ChunkingConfig(
                 chunk_size=chunk_size,
                 chunk_overlap=chunk_overlap,
-                method=ChunkingMethod.RECURSIVE
+                method=ChunkingMethod(chunking_method),
+                embeddings_provider=embeddings_provider,
+                embeddings_model=embeddings_model
             )
+            logger.info(f"✅ ChunkingConfig created successfully")
             
-            # Create generator directly
-            generator = RecursiveTextSplitterGenerator(chunking_config)
+            # Use the chunking service interface
+            logger.info("🏭 Creating ChunkingGeneratorInterface...")
+            chunking_service = ChunkingGeneratorInterface()
+            logger.info("✅ ChunkingGeneratorInterface created successfully")
             
             # Chunk synchronously
-            rag_chunks = generator.chunk_document_for_rag_sync(
+            rag_chunks = chunking_service.chunk_document_for_rag_sync(
                 text=markdown_content,
+                config=chunking_config,
+                provider=chunking_method,
                 document_metadata=document_metadata
             )
             
@@ -1716,9 +774,34 @@ class GenerateChunkEmbeddings:
             import asyncio
             from libs.embeddings_service import EmbeddingGeneratorInterface
             
-            # Get chunk result from previous step
-            chunk_result = self.inputs.get("chunk_document", {})
-            chunks = chunk_result.get("chunks", [])
+            # Handle both parallel task (fan-out) and normal execution
+            # In fan-out mode, chunk_documents is distributed by Celery and each child receives:
+            # - Either a single chunk dict directly, OR
+            # - The full chunk_documents result with "chunks" key
+            chunks_input = self.inputs.get("chunk_documents")
+            if chunks_input is None:
+                # Fallback to legacy single chunk_document step
+                chunks_input = self.inputs.get("chunk_document")
+            
+            # Normalize chunks_input to always be a list of chunk dicts
+            if isinstance(chunks_input, list):
+                # Already a list of chunks (from parallel task distribution or multiple documents)
+                chunks = chunks_input
+            elif isinstance(chunks_input, dict):
+                # Could be either:
+                # 1. ChunkDocument step result with "chunks" key: {"chunks": [...]}
+                # 2. Single chunk dict from fan-out: {"chunk_id": ..., "text": ..., ...}
+                if "chunks" in chunks_input and isinstance(chunks_input["chunks"], list):
+                    # Case 1: Full result from ChunkDocument step
+                    chunks = chunks_input["chunks"]
+                else:
+                    # Case 2: Single chunk from fan-out distribution
+                    chunks = [chunks_input]
+            else:
+                chunks = []
+            
+            # Preserve original input for debugging
+            chunk_result = chunks_input if isinstance(chunks_input, dict) else {"chunks": chunks}
             
             if not chunks:
                 logger.info("No chunks to generate embeddings for")
@@ -1734,8 +817,8 @@ class GenerateChunkEmbeddings:
                 }
             
             # Get embedding configuration from inputs or use defaults
-            embedding_model = self.inputs.get("embedding_model", "text-embedding-ada-002")
-            embedding_provider = self.inputs.get("embedding_provider", "openai")
+            embedding_model = self.inputs.get("embedding_model", "text-embedding-3-large")
+            embedding_provider = self.inputs.get("embedding_provider", "azure_openai")
             batch_size = self.inputs.get("embedding_batch_size", 100)  # Larger batch size for OpenAI
             
             # Create embedding service
@@ -1759,25 +842,55 @@ class GenerateChunkEmbeddings:
             # Run the async embedding generation
             embeddings = asyncio.run(generate_embeddings())
             
-            # Combine chunks with their embeddings
+            # Combine chunks with their embeddings and preserve file_name mapping
             chunks_with_embeddings = []
+            file_chunk_mapping = {}  # Map file_name -> list of (chunk_id, embedding)
+            
             for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
                 chunk_with_embedding = chunk.copy()
                 chunk_with_embedding["embedding"] = embedding
+                
+                # Extract file_name from chunk metadata
+                file_name = chunk.get("metadata", {}).get("file_name", "unknown")
+                chunk_id = chunk.get("chunk_id", f"chunk_{i}")
+                
                 chunk_with_embedding["embedding_metadata"] = {
                     "model": embedding_model,
                     "provider": embedding_provider,
                     "dimension": len(embedding),
-                    "chunk_index": i
+                    "chunk_index": i,
+                    "file_name": file_name  # Include file_name in embedding metadata
                 }
                 chunks_with_embeddings.append(chunk_with_embedding)
+                
+                # Build file_name to chunks/embeddings mapping
+                if file_name not in file_chunk_mapping:
+                    file_chunk_mapping[file_name] = []
+                file_chunk_mapping[file_name].append({
+                    "chunk_id": chunk_id,
+                    "chunk_index": i,
+                    "text": chunk.get("text", ""),
+                    "embedding_dimension": len(embedding)
+                })
             
             logger.info(f"Generated embeddings for {len(chunks_with_embeddings)} chunks using {embedding_model}")
+            logger.info(f"File mapping: {len(file_chunk_mapping)} unique files with chunks")
+            for file_name, chunk_list in file_chunk_mapping.items():
+                logger.info(f"  - {file_name}: {len(chunk_list)} chunks")
+            
+            if chunks_with_embeddings:
+                logger.info(f"Sample chunk with embedding: {chunks_with_embeddings[0].get('chunk_id', 'unknown')}")
+                logger.debug(f"First chunk keys: {list(chunks_with_embeddings[0].keys())}")
+                logger.debug(f"Has 'text' key: {'text' in chunks_with_embeddings[0]}")
+                logger.debug(f"Has 'embedding' key: {'embedding' in chunks_with_embeddings[0]}")
+                logger.debug(f"Embedding dimension: {len(chunks_with_embeddings[0].get('embedding', []))}")
             
             return {
                 "chunks_with_embeddings": chunks_with_embeddings,
+                "file_chunk_mapping": file_chunk_mapping,
                 "embedding_metadata": {
                     "total_chunks": len(chunks_with_embeddings),
+                    "total_files": len(file_chunk_mapping),
                     "embedding_model": embedding_model,
                     "embedding_provider": embedding_provider,
                     "embedding_dimension": len(embeddings[0]) if embeddings else 0,
@@ -1801,8 +914,6 @@ class GenerateChunkEmbeddings:
                 },
                 "chunk_result": self.inputs.get("chunk_document", {})
             }
-
-
 class StoreChunksInVectorDB:
     """Store document chunks in vector database"""
     
@@ -1849,31 +960,39 @@ class StoreChunksInVectorDB:
             from libs.database_service.service import DatabaseService
             
             # Get embedding result from previous step
-            embedding_result = self.inputs.get("generate_embeddings", {})
+            generate_emebedding_result = self.inputs.get("generate_embeddings", {})
             
             # Get client and project info directly from inputs
             client_id = self.inputs.get("client_id")
             project_id = self.inputs.get("project_id")
+
+            logger.info(f"Generate embedding result keys: {list(generate_emebedding_result.keys())}")
+            logger.info(f"Generate embedding result type: {type(generate_emebedding_result)}")
             
-            # Get chunks with embeddings from the embedding step
-            chunks = embedding_result.get("chunks_with_embeddings", [])
+            # Get chunks with embeddings - Celery handles distribution, so this is a single embedding
+            chunks_with_embeddings = generate_emebedding_result.get("chunks_with_embeddings", [])
+            logger.info(f"Extracted chunks_with_embeddings: {chunks_with_embeddings} chunks")
+            if chunks_with_embeddings:
+                logger.info(f"Sample chunk keys: {list(chunks_with_embeddings[0].keys())}")
+                logger.info(f"Has embedding: {'embedding' in chunks_with_embeddings[0]}")
+                logger.info(f"Sample text: {chunks_with_embeddings[0].get('text', '')[:100]}")
+#            if not chunks_with_embeddings:
+#                logger.info("No chunks to store in vector database")
+#                return {
+#                    "status": "failed",
+#                    "stored_chunks": 0,
+#                    "successful_uuids": [],
+#                    "reason": "no_chunks_in_inputs",
+#                    "chunk_result": generate_emebedding_result
+#                }
             
-            if not chunks:
-                logger.info("No chunks to store in vector database")
-                return {
-                    "status": "success",
-                    "stored_chunks": 0,
-                    "successful_uuids": [],
-                    "chunk_result": embedding_result
-                }
-            
-            # Initialize database service (same pattern as UploadToObjectStorage)
+            # Initialize database service
             db_service = DatabaseService()
             await db_service.initialize()
             
-            # Store chunks in vector database using the database service
-            vectorization_result = await db_service.store_chunks(
-                chunks=chunks,
+            # Store this single embedding set
+            vectorization_result = await db_service.store_embedding(
+                chunks_with_embeddings=chunks_with_embeddings,
                 client_id=client_id,
                 project_id=project_id
             )
@@ -1885,16 +1004,18 @@ class StoreChunksInVectorDB:
             
             result = {
                 "status": "success",
+                "embedding_id": generate_emebedding_result.get("embedding_id", ""),
                 "stored_chunks": vectorization_result.get("stored_chunks", 0),
                 "successful_uuids": vectorization_result.get("successful_uuids", []),
                 "vector_count": vectorization_result.get("stored_chunks", 0),
-                "chunk_result": embedding_result
+                "chunk_result": generate_emebedding_result
             }
             return result
             
         except Exception as e:
             logger.error(f"Error storing chunks in vector database: {e}")
             import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             return {
                 "status": "failed",
                 "error": str(e),
@@ -1903,9 +1024,10 @@ class StoreChunksInVectorDB:
                 "chunk_result": self.inputs.get("generate_embeddings", {})
             }
 
-class CreateDocumentMapping:
-    """Create document to chunks mapping in document database (Elasticsearch)"""
-    
+
+class SaveMappingToDocumentDB:
+    """Save per-file chunk embedding mappings into Elasticsearch document DB."""
+
     def __init__(self, inputs, project_name, prompt_config_src, pipeline_key):
         self.inputs = inputs
         self.project_name = project_name
@@ -1913,150 +1035,89 @@ class CreateDocumentMapping:
         self.pipeline_key = pipeline_key
 
     def execute(self) -> Dict[str, Any]:
-        
-        # Run the async execution in a new event loop
         import asyncio
         return asyncio.run(self._execute_async())
 
     async def _execute_async(self) -> Dict[str, Any]:
-        """Create document mapping in document database"""
         try:
             from libs.database_service.doc_db import ElasticsearchDocProvider
-            
-            # Get results from previous steps
-            vector_result = self.inputs.get("store_chunks_in_vector_db", {})
-            get_files_result = self.inputs.get("get_files", [])
-            
-            # Get client and project info from initial inputs
-            # Try to get from multiple possible sources
+
+            gen_result = self.inputs.get("generate_embeddings", {})
+
+            # Normalize to a flat list of chunks with embeddings
+            all_chunks_with_embeddings: List[Dict[str, Any]] = []
+            if isinstance(gen_result, list):
+                for item in gen_result:
+                    if isinstance(item, dict):
+                        all_chunks_with_embeddings.extend(item.get("chunks_with_embeddings", []) or [])
+            elif isinstance(gen_result, dict):
+                all_chunks_with_embeddings = gen_result.get("chunks_with_embeddings", []) or []
+
+            if not all_chunks_with_embeddings:
+                logger.info("No chunks_with_embeddings found; nothing to save to document DB")
+                return {"status": "failed", "error": "No chunks_with_embeddings found"}
+
+            # Group by file_name and shape to provider input
+            per_file_chunks: Dict[str, List[Dict[str, Any]]] = {}
+            for chunk in all_chunks_with_embeddings:
+                metadata = chunk.get("embedding_metadata", {}) or {}
+                file_name = metadata.get("file_name") or chunk.get("metadata", {}).get("file_name") or "unknown"
+                chunk_id = chunk.get("chunk_id")
+                embedding = chunk.get("embedding")
+                if chunk_id is None or embedding is None:
+                    continue
+                per_file_chunks.setdefault(file_name, []).append({
+                    "chunk_id": chunk_id,
+                    "embedding": embedding,
+                })
+
+            if not per_file_chunks:
+                logger.info("No valid per-file chunks to save")
+                return {"status": "failed", "error": "No valid per-file chunks to save"}
+
             client_id = self.inputs.get("client_id")
             project_id = self.inputs.get("project_id")
-            
-            # If not found in direct inputs, try to get from get_files_result metadata
-            if not client_id or not project_id:
-                file_data = get_files_result[0] if isinstance(get_files_result, list) and get_files_result else {}
-                metadata = file_data.get("metadata", {})
-                client_id = client_id or metadata.get("bucket") or metadata.get("client_id")
-                project_id = project_id or metadata.get("project_id")
-            
-            # Get the first file from GetFiles result
-            file_data = get_files_result[0] if isinstance(get_files_result, list) and get_files_result else {}
-            object_name = file_data.get("file_path", "unknown")
-            successful_uuids = vector_result.get("successful_uuids", [])
-            
-            if not successful_uuids:
-                logger.info("No successful UUIDs to create mapping for")
-                return {
-                    "status": "success",
-                    "doc_id": None,
-                    "mapping_created": False,
-                    "vector_result": vector_result,
-                    "get_files_result": get_files_result
-                }
-            
-            # Initialize Elasticsearch document provider
-            logger.info(f"Initializing Elasticsearch document provider for client: {client_id}, project: {project_id}")
-            doc_provider = ElasticsearchDocProvider()
-            init_result = await doc_provider.initialize()
-            if not init_result:
+            language = self.inputs.get("language", "en")
+
+            # Reasonable default index naming; include language, client, and project
+            base_index = "chunk-embeddings"
+            if client_id and project_id:
+                index_name = f"{base_index}-{language}-{client_id}-{project_id}"
+            else:
+                index_name = base_index
+
+            provider = ElasticsearchDocProvider()
+            ok = await provider.initialize()
+            if not ok:
                 raise RuntimeError("Failed to initialize Elasticsearch document provider")
-            logger.info("Elasticsearch document provider initialized successfully")
-            
-            # Create document mapping using Elasticsearch provider
-            doc_index_name = f"doc_mappings_{client_id}_{project_id}"
-            
-            mapping_metadata = {
-                "filename": file_data.get("file_path", "unknown"),
-                "client_id": client_id,
-                "project_id": project_id,
-                "file_extension": file_data.get("file_extension", ""),
-                "file_size": len(file_data.get("raw_data", b"")) if file_data.get("raw_data") else 0
-            }
-            
-            logger.info(f"Creating document mapping: index={doc_index_name}, doc_id={object_name}, chunks={len(successful_uuids)}")
-            
-            doc_response = await doc_provider.create_document_to_chunks_mapping(
-                index_name=doc_index_name,
-                document_id=object_name,
-                storage_object_name=object_name,
-                vector_chunk_ids=successful_uuids,
-                metadata=mapping_metadata,
-                client_id=client_id
-            )
-            
-            logger.info(f"Created document mapping for {object_name}")
-            
+
+            per_file_results: Dict[str, Any] = {}
+            indexed_total = 0
+            for file_name, chunks in per_file_chunks.items():
+                resp = await provider.save_chunk_embedding_mapping_to_document_db(
+                    index_name=index_name,
+                    file_name=file_name,
+                    chunks=chunks,
+                    client_id=client_id,
+                    project_id=project_id,
+                )
+                per_file_results[file_name] = resp
+                indexed_total += int(resp.get("indexed", 0))
+
+            logger.info(f"Saved chunk embedding mappings to ES index={index_name} for {len(per_file_chunks)} files. Total indexed={indexed_total}")
+
             return {
                 "status": "success",
-                "doc_id": doc_response.get("_id"),
-                "mapping_created": True,
-                "vector_result": vector_result,
-                "get_files_result": get_files_result
+                "index_name": index_name,
+                "indexed_total": indexed_total,
+                "per_file": per_file_results,
             }
-            
+
         except Exception as e:
-            logger.error(f"Error creating document mapping: {e}")
-            return {
-                "status": "failed",
-                "error": str(e),
-                "doc_id": None,
-                "mapping_created": False,
-                "vector_result": self.inputs.get("store_chunks_in_vector_db", {}),
-                "get_files_result": self.inputs.get("get_files", [])
-            }
-
-
-
-
-class PostProcessOutOfContext:
-    def __init__(self, inputs: Dict[str, Any], project_name: str, prompt_config_src: str, pipeline_key: str):
-        self.inputs = inputs
-
-
-    def execute(self) -> Dict[str, Any]:
-        """
-        - If IN-SCOPE: return the original input (pass-through).
-        - If OUT-OF-CONTEXT: return an empty string to block routing.
-        """
-        logger.info('########################## PostProcessOutOfContext ##########################')
-        print(f'{self.inputs=}')
-        
-        llm_response = self.inputs.get('out_of_context_detection')
-        llm_json_output =parse_llm_json_response(llm_response)
-        print(f'{llm_json_output=}')
-
-
-        if llm_json_output.get("is_out_of_context", True):
-            logger.info(f'the provided input is out of context')
-            return {**llm_json_output, 'action' :"SkiPeD!!"}
-        else:
-            # return {**llm_json_output, 'input_text' :self.inputs.get('input_text')}
-            return llm_json_output
-        
-
-
-class PostProcessSensitiveTopics:
-    def __init__(self, inputs: Dict[str, Any], project_name: str, prompt_config_src: str, pipeline_key: str):
-        self.inputs = inputs
-
-    def execute(self) -> Dict[str, Any]:
-        logger.info('########################## PostProcessSensitiveTopics ##########################')
-        print(f'{self.inputs=}')
-        
-        llm_response = self.inputs.get('detect_sensitive_topics')
-        llm_json_output =parse_llm_json_response(llm_response)
-        print(f'{llm_json_output=}')
-
-
-        if  llm_json_output.get("is_sensitive", False):
-            # Block sensitive inputs
-            reason = llm_json_output.get("reason")
-            matched_topics = llm_json_output.get("matched_topics", [])
-            logger.info(f'the provided input is sentisive')
-
-            return {**llm_json_output, 'action' : "SkiPeD!!"}
-        else:
-            return llm_json_output
+            logger.error(f"Error saving chunk embeddings mapping to document DB: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            raise
 
 
 class ExtractUserFacts:
@@ -2088,7 +1149,6 @@ class ExtractUserFacts:
 
 
 
-
 class FetchUserFacts:
     def __init__(self, inputs: Dict[str, Any], project_name: str, prompt_config_src: str, pipeline_key: str):
         self.inputs = inputs
@@ -2115,51 +1175,6 @@ class FetchUserFacts:
 
         return response
 
-        
-
-
-class RunCypherQuery:
-    def __init__(self, inputs: Dict[str, Any], project_name: str, prompt_config_src: str, pipeline_key: str):
-        self.inputs = inputs
-
-    def execute(self) -> Dict[str, Any]:
-        logger.info('########################## RunCypherQuery ##########################')
-        logger.info(f'{self.inputs=}')
-        # Run the async execution in a new event loop
-        import asyncio
-        return asyncio.run(self._execute_async())
-
-    async def _execute_async(self) -> Dict[str, Any]:
-        llm_response = self.inputs.get('convert_nl2cypher')
-        llm_json_output =parse_llm_json_response(llm_response)
-        cypher =llm_json_output.get('cypher', '')
-
-        logger.info(f'{llm_json_output=}')
-        logger.info(f'{cypher=}')
-        if cypher =='':
-            return {'cypher' :"", 'references' : []}
-
-        database_service = DatabaseService()
-        await database_service.initialize()
-
-        cypher =clean_cypher_query(cypher)
-        results = await database_service.graph_manager.run_query(cypher)
-
-
-        #########################################################
-        logger.info(f'{type(results)=}')
-        logger.info(f'{len(results)=}')
-        logger.info(f'{results=}')
-        with open('neo4j_result_dump.json', 'w', encoding='utf-8') as f:
-            json.dump(results, f, indent=4, ensure_ascii=False)
-        #########################################################
-
-
-        self.inputs['references'] =json.dumps(results)
-
-        return {"cypher": cypher, "references": results}
-    
-
 class Save2ChatHistory:
     def __init__(self, inputs: Dict[str, Any], project_name: str,
                  prompt_config_src: str, pipeline_key: str):
@@ -2180,6 +1195,10 @@ class Save2ChatHistory:
         """
         return self.inputs.get('content')
 
+    def get_references(self) -> str:    
+        return self.inputs.get('references', '["EmPtY!!"]')
+
+
     def execute(self) -> Dict[str, Any]:
         logger.info('########################## Save2ChatHistory ##########################')
         logger.info(f'{self.inputs=}')
@@ -2187,22 +1206,30 @@ class Save2ChatHistory:
         client_id = self.inputs.get('client_id')
         project_id = self.inputs.get('project_id')
         session_id = self.inputs.get('session_id')
+        user_id = self.inputs.get('user_id') 
         role = self.get_role()
+        references=self.get_references()
 
         db = PgSQLProvider()
         msg_id = db.store_message(
             client_id=client_id,
             project_id=project_id,
             session_id=session_id,
+            user_id=user_id,
             role=role,
-            content=self.content
+            content=self.content, 
+            references=references
         )
+
+        logger.info(f'####################################\n########################{msg_id=}')
+        logger.info(f'{references=}')
 
         logger.info(f'successfully stored {role} message with id {msg_id}')
         return {
             "message_id": msg_id,
             "role": role,
-            "content": self.content
+            "content": self.content, 
+            "references": references
         }
 
 
@@ -2213,20 +1240,15 @@ class SaveUserMessage(Save2ChatHistory):
     def get_content(self) -> str:
         return self.inputs.get("input_text")
 
-
-class SaveLLMMessage(Save2ChatHistory):
-    def get_role(self) -> str:
-        return "assistant"
-
-    def get_content(self) -> str:
-        return self.inputs.get("run_graph_rag")
-
+    def get_references(self) -> str:
+        return '[]'
+    
 class SaveVectorLLMMessage(Save2ChatHistory):
     def get_role(self) -> str:
         return "assistant"
 
     def get_content(self) -> str:
-        return self.inputs.get("naive-rag-inference")
+        return self.inputs.get("run_vector_rag")
 
 
 class SearchRelevantChunks:
@@ -2236,7 +1258,7 @@ class SearchRelevantChunks:
         self.inputs = inputs
 
     def execute(self) -> Dict[str, Any]:
-        """Search for relevant chunks using ChromaDB's built-in similarity search"""
+        """Search for relevant chunks using ChromaDB's built-in similarity search, optionally including embeddings"""
         logger.info('########################## SearchRelevantChunks ##########################')
         logger.info(f'{self.inputs=}')
 
@@ -2244,6 +1266,7 @@ class SearchRelevantChunks:
         client_id = self.inputs.get('client_id')
         project_id = self.inputs.get('project_id')
         top_k = self.inputs.get('top_k', 5)  # Default to 5 most relevant chunks
+        include_embeddings = self.inputs.get('enable_diversification', False)  # Include embeddings only if diversification is enabled
         
         if not all([input_text, client_id, project_id]):
             logger.warning("Missing required inputs for chunk search")
@@ -2276,8 +1299,12 @@ class SearchRelevantChunks:
             # Get the ChromaDB provider
             chroma_provider = db_service.vector_manager.provider
             
+            # Get language from inputs
+            language = self.inputs.get('language', 'en')
+            
             # Set the collection name to match the same format used in store_chunks
-            chroma_provider.base_collection_name = f"chunks_{client_id}_{project_id}"
+            chroma_provider.base_collection_name = f"chunks_{language}_{client_id}_{project_id}"
+            logger.info(f"Searching in ChromaDB collection: chunks_{language}_{client_id}_{project_id}")
             
             # Use ChromaDB's built-in similarity search with custom embeddings
             relevant_chunks = asyncio.run(
@@ -2350,6 +1377,202 @@ class SearchRelevantChunks:
             }
 
 
+class GetVectorReference:
+    """
+    Resolve chunk_ids to filenames using ChromaDB metadata (primary) or Elasticsearch (fallback).
+    
+    With unified SHA256 chunk_ids, this step is now much simpler and more reliable.
+    """
+    
+    def __init__(self, inputs: Dict[str, Any], project_name: str, prompt_config_src: str, pipeline_key: str):
+        self.inputs = inputs
+
+    def execute(self) -> Dict[str, Any]:
+        """
+        Resolve chunk_ids to filenames.
+        
+        Strategy:
+        1. Extract file_name from ChromaDB chunk metadata (fastest, preferred)
+        2. If metadata missing, query Elasticsearch by chunk_id (now works with unified IDs!)
+        
+        Returns:
+            Dict with status, references list, and metadata
+            - status: "completed" or "failed"
+            - references: List[Dict[str, str]] of {chunk_id: filename} mappings
+            - error: Error message if failed
+        """
+        try:
+            # Extract inputs
+            client_id = self.inputs['client_id']
+            project_id = self.inputs['project_id']
+            language = self.inputs.get('language', 'en')
+            relevant_chunks = self.inputs['search_relevant_chunks']['relevant_chunks']
+            
+            logger.info(f"GetVectorReference: Processing {len(relevant_chunks)} chunks for {language}/{client_id}/{project_id}")
+            
+            if not relevant_chunks:
+                logger.warning("No relevant chunks to process")
+                return {
+                    "status": "completed",
+                    "references": [],
+                    "total_mapped": 0,
+                    "total_requested": 0,
+                    "source": "no_chunks"
+                }
+            
+            # Strategy 1: Extract file_name from ChromaDB metadata (preferred)
+            references = []
+            chunk_ids_without_metadata = []
+            
+            for i, chunk in enumerate(relevant_chunks):
+                chunk_id = chunk.get('chunk_id') or chunk.get('metadata', {}).get('chunk_id')
+                metadata = chunk.get('metadata', {})
+                
+                # Try to get file_name from metadata
+                file_name = (
+                    metadata.get('file_name') or 
+                    metadata.get('filename') or 
+                    metadata.get('object_name') or
+                    metadata.get('source') or
+                    metadata.get('file_path')
+                )
+                
+                if i < 3:  # Log first 3 chunks for debugging
+                    logger.info(f"Chunk {i}: chunk_id={chunk_id[:16]}..., file_name={file_name}")
+                
+                if file_name and chunk_id:
+                    # Extract just the filename if it's a path
+                    import os
+                    file_name = os.path.basename(file_name) if ('/' in file_name or '\\' in file_name) else file_name
+                    references.append({chunk_id: file_name})
+                elif chunk_id:
+                    chunk_ids_without_metadata.append(chunk_id)
+                else:
+                    logger.warning(f"Chunk {i} has no chunk_id")
+            
+            logger.info(f"Extracted {len(references)} references from metadata, {len(chunk_ids_without_metadata)} need ES lookup")
+            
+            # If all references found from metadata, return immediately
+            if len(references) == len(relevant_chunks):
+                logger.info(f"✅ All {len(references)} references extracted from ChromaDB metadata")
+                return {
+                    "status": "completed",
+                    "references": references,
+                    "total_mapped": len(references),
+                    "total_requested": len(relevant_chunks),
+                    "source": "chromadb_metadata"
+                }
+            
+            # Strategy 2: Query Elasticsearch for missing chunk_ids (unified IDs make this work!)
+            if chunk_ids_without_metadata:
+                logger.info(f"Querying Elasticsearch for {len(chunk_ids_without_metadata)} chunk_ids")
+                
+                from libs.database_service.doc_db import ElasticsearchDocProvider
+                import asyncio
+                
+                # Build index name with language
+                index_name = f"chunk-embeddings-{language}-{client_id}-{project_id}"
+                
+                async def _fetch_from_elasticsearch():
+                    try:
+                        doc_provider = ElasticsearchDocProvider()
+                        await doc_provider.initialize()
+                        
+                        # Query by chunk_id using terms query
+                        query = {
+                            "query": {
+                                "terms": {
+                                    "chunk_id.keyword": chunk_ids_without_metadata
+                                }
+                            }
+                        }
+                        
+                        results = await doc_provider.search(
+                            index=index_name,
+                            query=query,
+                            size=len(chunk_ids_without_metadata),
+                            client_id=None  # Index name already scoped
+                        )
+                        
+                        # Fallback: try without .keyword if no results
+                        if not results:
+                            logger.warning("No results with chunk_id.keyword, trying without .keyword")
+                            query["query"]["terms"] = {"chunk_id": chunk_ids_without_metadata}
+                            results = await doc_provider.search(
+                                index=index_name,
+                                query=query,
+                                size=len(chunk_ids_without_metadata),
+                                client_id=None
+                            )
+                        
+                        logger.info(f"Elasticsearch returned {len(results)} documents from {index_name}")
+                        return results
+                        
+                    except Exception as e:
+                        logger.error(f"Elasticsearch query failed: {e}")
+                        import traceback
+                        logger.error(f"Traceback: {traceback.format_exc()}")
+                        return []
+                
+                es_results = asyncio.run(_fetch_from_elasticsearch())
+                
+                # Add ES results to references
+                for doc in es_results:
+                    chunk_id = doc.get('chunk_id')
+                    file_name = doc.get('file_name')
+                    if chunk_id and file_name:
+                        references.append({chunk_id: file_name})
+                        logger.debug(f"Mapped chunk {chunk_id[:16]}... to {file_name}")
+                
+                logger.info(f"Added {len(es_results)} references from Elasticsearch")
+            
+            # Final result
+            total_mapped = len(references)
+            total_requested = len(relevant_chunks)
+            
+            if total_mapped == 0:
+                error_msg = (
+                    f"Could not map any chunk_ids to filenames. "
+                    f"Requested {total_requested} chunks but found 0 references. "
+                    f"This may indicate: "
+                    f"1) Data not indexed in Elasticsearch, "
+                    f"2) Index name mismatch, or "
+                    f"3) Missing metadata in ChromaDB"
+                )
+                logger.error(error_msg)
+                return {
+                    "status": "failed",
+                    "error": error_msg,
+                    "references": [],
+                    "total_mapped": 0,
+                    "total_requested": total_requested
+                }
+            
+            # Success!
+            source = "chromadb_metadata" if len(chunk_ids_without_metadata) == 0 else "chromadb_and_elasticsearch"
+            logger.info(f"✅ Successfully mapped {total_mapped}/{total_requested} chunk_ids to filenames")
+            
+            return {
+                "status": "completed",
+                "references": references,
+                "total_mapped": total_mapped,
+                "total_requested": total_requested,
+                "source": source
+            }
+            
+        except Exception as e:
+            logger.error(f"GetVectorReference failed: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            
+            return {
+                "status": "failed",
+                "error": str(e),
+                "references": [],
+                "total_mapped": 0
+            }
+
+
 class FetchChatHistory:
     """Fetch recent chat history for the current session"""
     
@@ -2364,6 +1587,7 @@ class FetchChatHistory:
         client_id = self.inputs.get('client_id')
         project_id = self.inputs.get('project_id')
         session_id = self.inputs.get('session_id')
+        user_id = self.inputs.get('user_id')
         limit = self.inputs.get('limit', 10)  # Default to 10 messages
         
         if not all([client_id, project_id, session_id]):
@@ -2375,7 +1599,8 @@ class FetchChatHistory:
                     "limit": limit,
                     "client_id": client_id,
                     "project_id": project_id,
-                    "session_id": session_id
+                    "session_id": session_id,
+                    "user_id": user_id
                 }
             }
 
@@ -2390,6 +1615,7 @@ class FetchChatHistory:
                 client_id=client_id,
                 project_id=project_id,
                 session_id=session_id,
+                user_id=user_id,
                 limit=limit
             )
             
@@ -2415,7 +1641,8 @@ class FetchChatHistory:
                     "limit": limit,
                     "client_id": client_id,
                     "project_id": project_id,
-                    "session_id": session_id
+                    "session_id": session_id,
+                    "user_id": user_id
                 }
             }
             
@@ -2432,45 +1659,129 @@ class FetchChatHistory:
                     "client_id": client_id,
                     "project_id": project_id,
                     "session_id": session_id,
+                    "user_id": user_id,
                     "error": str(e)
                 }
             }
 
+
+class CombineVectorResponseAndReferences:
+    """Format LLM response and vector references into a compact payload.
+
+    Inputs expected:
+      - run_vector_rag: the raw LLM response (string or dict)
+      - GetVectorReference: object with key 'references' = List[{chunk_id: file_name}]
+      - search_relevant_chunks: object with key 'relevant_chunks' = List[chunk dicts]
+
+    Output:
+      {
+        "llm_response": <clean string>,
+        "references": "<json stringified list of {file_name, chunk_id, embedding?}>"
+      }
+    """
+
+    def __init__(self, inputs: Dict[str, Any], project_name: str, prompt_config_src: str, pipeline_key: str):
+        self.inputs = inputs
+
+    def execute(self) -> Dict[str, Any]:
+        import json
+
+        # Extract and clean LLM response
+        llm_raw = self.inputs.get("run_vector_rag")
+        if isinstance(llm_raw, (dict, list)):
+            llm_text = json.dumps(llm_raw, ensure_ascii=False)
+        elif llm_raw is None:
+            llm_text = ""
+        else:
+            llm_text = str(llm_raw)
+        llm_text = llm_text.strip()
+
+        # Build references by joining GetVectorReference mappings with retrieved chunks
+        gvr = self.inputs.get("GetVectorReference", {}) or {}
+        references_mappings: List[Dict[str, str]] = gvr.get("references", []) or []
+
+        search_result = self.inputs.get("search_relevant_chunks", {}) or {}
+        relevant_chunks: List[Dict[str, Any]] = search_result.get("relevant_chunks", []) or []
+
+        # Index chunks by chunk_id for fast lookup; support multiple possible locations
+        chunk_by_id: Dict[str, Dict[str, Any]] = {}
+        for chunk in relevant_chunks:
+            chunk_id = (
+                chunk.get("chunk_id")
+                or (chunk.get("metadata") or {}).get("chunk_id")
+                or (chunk.get("embedding_metadata") or {}).get("chunk_id")
+            )
+            if chunk_id:
+                chunk_by_id[chunk_id] = chunk
+
+        formatted_references: List[Dict[str, Any]] = []
+        for mapping in references_mappings:
+            # Each mapping is like {chunk_id: file_name}
+            if not isinstance(mapping, dict) or not mapping:
+                continue
+            # Extract the single pair
+            [(cid, file_name)] = list(mapping.items())[:1]
+
+            chunk = chunk_by_id.get(cid, {})
+            embedding = (
+                chunk.get("embedding")
+                or (chunk.get("metadata") or {}).get("embedding")
+                or (chunk.get("embedding_metadata") or {}).get("embedding")
+            )
+
+            formatted_references.append({
+                "file_name": file_name,
+                "chunk_id": cid,
+                "embedding": embedding,
+            })
+
+        # Serialize references as JSON string per requirement
+        references_json = json.dumps(formatted_references, ensure_ascii=False, default=str)
+
+        return {
+            "llm_output": llm_text,
+            "references": references_json,
+        }
+
+class PassThrough:
+    """Pass through the input unchanged - useful for pipeline debugging or data flow"""
+    
+    def __init__(self, inputs: Dict[str, Any], project_name: str, prompt_config_src: str, pipeline_key: str):
+        self.inputs = inputs
+        self.project_name = project_name
+        self.prompt_config_src = prompt_config_src
+        self.pipeline_key = pipeline_key
+
+    def execute(self) -> Dict[str, Any]:
+        """Return the input unchanged"""
+        logger.info('########################## PassThrough ##########################')
+        logger.info(f'Passing through inputs unchanged for pipeline_key: {self.pipeline_key}')
+        return self.inputs
 
 
 # Pipeline operations mapping - only include the classes that are actually used
 pipeline_operations: Dict[str, Any] = {
     "GetFiles": GetFiles,
     "ParseDocuments": ParseDocuments,
-    # Legacy full pipeline (now delegates to split steps)
-    "execute_full_graphrag_pipeline": ExecuteFullGraphRAGPipeline,
     # New split pipeline steps
     "chunk_documents": ChunkDocuments,
-    "build_graph_from_chunks": BuildGraphFromChunks,
-    "build_graph_from_extracted": BuildGraphFromExtracted,
-    "store_graph_to_neo4j": StoreGraphToNeo4j,
-    # Existing embedding steps
-    "prepare_nodes_description_for_embeddings": PrepareNodesDescriptionForEmbeddings,
-    "generate_entity_embeddings": GenerateEntityEmbeddings,
-    "update_neo4j_nodes_with_embeddings": UpdateNeo4jNodesWithEmbeddings,
-    # graph inference steps
-    "post_process_out_of_context": PostProcessOutOfContext,
-    "post_process_sensitive_topics": PostProcessSensitiveTopics,
-    "run_cypher_query": RunCypherQuery,
-     # Document preprocessing pipeline operations
+    # Document preprocessing pipeline operations
     "UploadToObjectStorage": UploadToObjectStorage,
     "ParseDocumentToMarkdown": ParseDocumentToMarkdown,
-    "ChunkDocumentForRAG": ChunkDocumentForRAG,
+    "ChunkDocument": ChunkDocument,
     "GenerateChunkEmbeddings": GenerateChunkEmbeddings,
     "StoreChunksInVectorDB": StoreChunksInVectorDB,
-    "CreateDocumentMapping": CreateDocumentMapping,
+    "save_mapping_to_document_db": SaveMappingToDocumentDB,
     "extract_user_facts": ExtractUserFacts,
     "fetch_user_facts": FetchUserFacts,
     "save_user_message": SaveUserMessage,
-    "save_llm_message": SaveLLMMessage,
     "save_vector_llm_message": SaveVectorLLMMessage,
     "search_relevant_chunks": SearchRelevantChunks,
+    "GetVectorReference": GetVectorReference,
     "fetch_chat_history": FetchChatHistory,
+    # Utility operations
+    "combine_vector_response_and_references": CombineVectorResponseAndReferences,
+    "PassThrough": PassThrough,
 }
 
 def log_processing_details(pipeline_key, inputs=None, results=None, input_item=None, stage="start"):
@@ -2487,7 +1798,7 @@ def log_processing_details(pipeline_key, inputs=None, results=None, input_item=N
 
 
 
-async def process_operation_async(operation, inputs, pipeline_key, project_name, prompt_config_src):
+async def process_operation_async(operation, inputs, pipeline_key, project_name, prompt_config):
     """Process operation with proper async handling."""
     try:
         if hasattr(operation, 'execute'):
@@ -2503,9 +1814,18 @@ async def process_operation_async(operation, inputs, pipeline_key, project_name,
         logger.error(f"Error in process_operation_async for {pipeline_key}: {e}")
         raise
 
-def process_operation(operation, inputs, pipeline_key, project_name, prompt_config_src):
+def process_operation(operation, inputs, pipeline_key, project_name, prompt_config):
     """Process operation with proper handling."""
     try:
+        # Global skip gate for operation-based steps
+        try:
+            flat_inputs = flatten_dict(inputs) if isinstance(inputs, dict) else {}
+            if any('SkiPeD!!' in str(v) for v in flat_inputs.values()):
+                logger.info(f"Operation step '{pipeline_key}' skipped due to SkiPeD!! in inputs")
+                return {"output": "SkiPeD!!"}
+        except Exception:
+            pass
+
         if hasattr(operation, 'execute'):
             return operation.execute()
         else:
@@ -2515,48 +1835,10 @@ def process_operation(operation, inputs, pipeline_key, project_name, prompt_conf
         raise
 
 
-def process_normalization_inputs(inputs: Dict[str, Any]) -> Dict[str, Any]:
-    """Process inputs for entity normalization step by parsing entities and relationships"""
-    import json
-    from libs.graph_builder_service import GraphRAGResponseParser
-    
-    processed_inputs = inputs.copy()
-    
-    # Parse entities
-    entities_raw = inputs.get("extract_entities", "")
-    if isinstance(entities_raw, str):
-        logger.info("Parsing entities for normalization")
-        entities_parsed = GraphRAGResponseParser.parse_entities_response(entities_raw)
-        # Convert to simple format for the prompt
-        entities_list = []
-        for entity in entities_parsed:
-            if isinstance(entity, dict):
-                name = entity.get('name', '')
-                entity_type = entity.get('type', '')
-                description = entity.get('description', '')
-                entities_list.append(f"{name} ({entity_type}): {description}")
-        processed_inputs["entities"] = "\n".join(entities_list)
-    
-    # Parse relationships
-    relationships_raw = inputs.get("extract_relationships", "")
-    if isinstance(relationships_raw, str):
-        logger.info("Parsing relationships for normalization")
-        relationships_parsed = GraphRAGResponseParser.parse_relationships_response(relationships_raw)
-        # Convert to simple format for the prompt
-        relationships_list = []
-        for rel in relationships_parsed:
-            if isinstance(rel, dict):
-                source = rel.get('source_entity', '')
-                target = rel.get('target_entity', '')
-                rel_type = rel.get('relationship_type', '')
-                relationships_list.append(f"{source} -> {target} ({rel_type})")
-        processed_inputs["relationships"] = "\n".join(relationships_list)
-    
-    logger.info(f"Processed normalization inputs: entities={len(entities_list) if 'entities_list' in locals() else 0}, relationships={len(relationships_list) if 'relationships_list' in locals() else 0}")
-    return processed_inputs
 
 
-def execute_pipeline_step(inputs: Dict[str, Any], project_name: str, prompt_config_src: str, pipeline_key: str, json_object: bool = False, domain_id: str = None) -> Any:
+
+def execute_pipeline_step(inputs: Dict[str, Any], project_name: str, prompt_config: Dict[str, Any], pipeline_key: str, json_object: bool = False, domain_id: str = None, save_to_db: str = None) -> Any:
     """Execute a pipeline step with proper error handling and logging."""
     log_processing_details(pipeline_key, stage="start")
     
@@ -2566,30 +1848,36 @@ def execute_pipeline_step(inputs: Dict[str, Any], project_name: str, prompt_conf
             log_processing_details(pipeline_key, stage="operation_found")
             
             # Create operation instance
-            operation = operation_cls(inputs, project_name, prompt_config_src, pipeline_key)
+            operation = operation_cls(inputs, project_name, prompt_config, pipeline_key)
             
             # Process operation with proper async handling
-            operation_results = process_operation(operation, inputs, pipeline_key, project_name, prompt_config_src)
+            operation_results = process_operation(operation, inputs, pipeline_key, project_name, prompt_config)
             
             log_processing_details(pipeline_key, results=operation_results, stage="end")
+            
+            # Store results if save_to_db is specified
+            if save_to_db:
+                _store_step_results(pipeline_key, operation_results, project_name, save_to_db, pipeline_key)
+            
             return operation_results
         else:
             # Clean else fallback: treat pipeline_key as prompt_key
             # Fetch from PromptStore (Langfuse) and execute via LLMGateway
             logger.info(f"Pipeline key '{pipeline_key}' not in operations, treating as prompt-based step")
             
-            # Special handling for entity-normalization step
-            if pipeline_key == "entity-normalization":
-                processed_inputs = process_normalization_inputs(inputs)
-            else:
-                processed_inputs = inputs
+            processed_inputs = inputs
             
             llm_gateway = LLMGateway()
             
             operation_results = llm_gateway.send_request_sync(
-                processed_inputs, project_name, prompt_config_src, pipeline_key, json_object=json_object, domain_id=domain_id
+                processed_inputs, project_name, prompt_config, pipeline_key, json_object=json_object, domain_id=domain_id
             )
             log_processing_details(pipeline_key, results=operation_results, stage="end")
+            
+            # Store results if save_to_db is specified
+            if save_to_db:
+                _store_step_results(pipeline_key, operation_results, project_name, save_to_db, pipeline_key)
+            
             return operation_results
             
     except Exception as e:
@@ -2599,3 +1887,28 @@ def execute_pipeline_step(inputs: Dict[str, Any], project_name: str, prompt_conf
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")
         raise Exception(error_msg) from e
+
+
+def _store_step_results(step_name: str, results: Any, project_name: str, storage_type: str, pipeline_key: str):
+    """Helper function to store pipeline step results"""
+    try:
+        store_results = get_store_results()
+        storage_key = store_results.store_step_results_sync(
+            step_name=step_name,
+            data=results,
+            project_name=project_name,
+            storage_type=storage_type,
+            pipeline_key=pipeline_key,
+            additional_metadata={
+                "step_type": "pipeline_operation" if step_name in pipeline_operations else "prompt_based"
+            }
+        )
+        
+        if storage_key:
+            logger.info(f"Successfully stored {step_name} results with key: {storage_key}")
+        else:
+            logger.warning(f"Failed to store {step_name} results")
+            
+    except Exception as e:
+        logger.error(f"Error storing {step_name} results: {e}")
+        # Don't raise exception to avoid breaking the pipeline

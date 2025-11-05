@@ -135,12 +135,12 @@ class VectorDatabaseService(BaseVectorProvider):
             collection_name=collection_name
         )
     
-    async def store_chunks(self, chunks: List[Dict[str, Any]], client_id: str, project_id: str) -> Dict[str, Any]:
+    async def store_embedding(self, chunks_with_embeddings: List[Dict[str, Any]], client_id: str, project_id: str) -> Dict[str, Any]:
         """
-        Store document chunks in the vector database
+        Store a single set of chunks with embeddings in the vector database
         
         Args:
-            chunks: List of chunk dictionaries containing text and metadata
+            chunks_with_embeddings: List of chunks with their embeddings
             client_id: Client identifier for data isolation
             project_id: Project identifier for data isolation
             
@@ -151,25 +151,47 @@ class VectorDatabaseService(BaseVectorProvider):
             raise RuntimeError("Vector database service not initialized")
         
         try:
-            # Update collection name to be scoped to client and project
-            if hasattr(self.provider, 'base_collection_name'):
-                collection_name = f"chunks_{client_id}_{project_id}" if client_id and project_id else "documents"
-                # Update the provider's collection name if it supports it
-                if hasattr(self.provider, 'base_collection_name'):
-                    self.provider.base_collection_name = collection_name
+            # Extract language from chunk metadata (if available)
+            language = "en"  # Default
+            if chunks_with_embeddings and len(chunks_with_embeddings) > 0:
+                first_chunk = chunks_with_embeddings[0]
+                language = first_chunk.get("metadata", {}).get("language", "en")
             
-            result = await self.provider.store_chunks(chunks, client_id, project_id)
+            # Update collection name to be scoped to language, client, and project
+            if hasattr(self.provider, 'base_collection_name'):
+                collection_name = f"chunks_{language}_{client_id}_{project_id}" if client_id and project_id else "documents"
+                self.provider.base_collection_name = collection_name
+                logger.info(f"Using ChromaDB collection: {collection_name}")
+            
+            result = await self.provider.store_embedding(chunks_with_embeddings, client_id, project_id)
             logger.info(f"Successfully stored {result.get('stored_chunks', 0)} chunks using {self.vector_db_type}")
             return result
             
         except Exception as e:
-            logger.error(f"Failed to store chunks in vector database: {e}")
+            logger.error(f"Failed to store embedding in vector database: {e}")
             return {
                 "status": "failed",
                 "error": str(e),
                 "stored_chunks": 0,
                 "successful_uuids": []
             }
+    
+    async def store_chunks(self, chunks: List[Dict[str, Any]], client_id: str, project_id: str) -> Dict[str, Any]:
+        """
+        Store document chunks in the vector database
+        
+        Deprecated: Use store_embedding instead. This method is kept for backward compatibility.
+        
+        Args:
+            chunks: List of chunk dictionaries containing text and metadata
+            client_id: Client identifier for data isolation
+            project_id: Project identifier for data isolation
+            
+        Returns:
+            Dictionary containing the result of the storage operation
+        """
+        logger.warning("store_chunks is deprecated, use store_embedding instead")
+        return await self.store_embedding(chunks, client_id, project_id)
     
     async def similarity_search(self, query: str, client_id: str, project_id: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """

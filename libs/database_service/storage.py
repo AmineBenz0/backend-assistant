@@ -233,17 +233,6 @@ class MinIOStorageManager:
             job_id, "embeddings", embeddings, metadata
         )
     
-    async def store_graph_output(
-        self,
-        job_id: str,
-        graph_data: Dict[str, Any],
-        metadata: Optional[Dict[str, Any]] = None
-    ) -> str:
-        """Store graph building output"""
-        return await self.store_preprocessing_output(
-            job_id, "graph", graph_data, metadata
-        )
-    
     async def retrieve_output(
         self,
         bucket_name: str,

@@ -1,32 +1,63 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Dict, Any
+
+
+# OpenAPI examples for WorkflowRequest
+WORKFLOW_REQUEST_EXAMPLES = {
+    "vector_preprocessing": {
+        "summary": "Vector Preprocessing",
+        "description": "Example for vector-based preprocessing workflow",
+        "value": {
+            "input": {
+                "client_id": "dpac",
+                "domain_id": "dpac",
+                "language": "it",
+                "project_id": "dpac_portal_test_1",
+                "chunking_method": "semantic_chunker",
+                "embedding_model": "text-embedding-3-large",
+                "embedding_provider": "azure_openai",
+                "embedding_batch_size": 10,
+                "workflow_id": "vector_preprocessing_001"
+            }
+        }
+    },
+}
+
+
+# OpenAPI examples for ChatRequest
+CHAT_REQUEST_EXAMPLES = {
+    "vector_inference": {
+        "summary": "Vector Inference",
+        "description": "Example for vector-based inference workflow",
+        "value": {
+            "input": {
+                "client_id": "dpac",
+                "domain_id": "dpac",
+                "input_text": "cos'è il D.PaC?",
+                "language": "it",
+                "project_id": "dpac_portal",
+                "session_id": "test_session_001",
+                "user_id": "user123",
+                "top_k": 5,
+                "limit": 10,
+                "workflow_id": "vector_inference_001"
+            }
+        }
+    },
+}
 
 
 class WorkflowRequest(BaseModel):
     input: Dict[str, Any] = Field(
         ...,
-        description="Workflow input parameters",
-        example={
-            "workflow_id": "graph_preprocessing_001",
-            "client_id": "testclient",
-            "project_id": "testproject",
-            "domain_id": "resume"
-        }
+        description="Workflow input parameters"
     )
 
 
 class ChatRequest(BaseModel):
     input: Dict[str, Any] = Field(
         ...,
-        description="Chat workflow input parameters",
-        example={
-            "workflow_id": "graph_inference_001",
-            "client_id": "testclient",
-            "domain_id": "dpac",
-            "project_id": "dpac",
-            "session_id": "123",
-            "input_text": "what is dpac?"
-        }
+        description="Chat workflow input parameters"
     )
 
 

@@ -3,14 +3,12 @@ Abstract base classes for document processors
 """
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional, AsyncGenerator
-import asyncio
 import uuid
 import time
-from pathlib import Path
 
 from ..models import (
-    ProcessingJob, ProcessingResult, ProcessingConfig, ProcessingType,
-    ProcessingStatus, ProcessingProgress, DocumentMetadata, EmbeddingResult, GraphResult
+    ProcessingJob, ProcessingResult, ProcessingConfig,
+    ProcessingStatus, ProcessingProgress
 )
 
 
@@ -150,36 +148,3 @@ class AbstractDocumentProcessor(ABC):
                                if j.status == ProcessingStatus.FAILED])
         }
 
-
-class AbstractHybridProcessor(AbstractDocumentProcessor):
-    """Abstract processor that can handle both embedding and graph processing"""
-    
-    @abstractmethod
-    async def process_embedding_only(
-        self, 
-        file_paths: List[str],
-        config: ProcessingConfig,
-        job_id: str
-    ) -> EmbeddingResult:
-        """Process documents for embedding only"""
-        pass
-    
-    @abstractmethod
-    async def process_graph_only(
-        self, 
-        file_paths: List[str],
-        config: ProcessingConfig,
-        job_id: str
-    ) -> GraphResult:
-        """Process documents for graph only"""
-        pass
-    
-    @abstractmethod
-    async def process_hybrid(
-        self, 
-        file_paths: List[str],
-        config: ProcessingConfig,
-        job_id: str
-    ) -> tuple[EmbeddingResult, GraphResult]:
-        """Process documents for both embedding and graph"""
-        pass

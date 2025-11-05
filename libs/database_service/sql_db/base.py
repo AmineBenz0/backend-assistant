@@ -5,23 +5,19 @@ class ChatHistoryProvider(ABC):
     """Abstract interface for sync chat history storage."""
 
     @abstractmethod
-    def store_message(self, client_id, project_id, session_id, role, content):
+    def store_message(self, client_id, project_id, session_id, user_id, role, content, references=None):
         pass
 
     @abstractmethod
-    def get_messages(self, client_id, project_id, session_id):
+    def get_messages(self, client_id=None, project_id=None, session_id=None, user_id=None, limit=None):
         pass
 
     @abstractmethod
-    def get_recent_messages(self, client_id, project_id, session_id, limit=10):
+    def get_recent_messages(self, client_id, project_id, session_id, user_id=None, limit=10):
         pass
 
     @abstractmethod
-    def search_messages(self, client_id, project_id, session_id, keyword):
-        pass
-
-    @abstractmethod
-    def delete_session_messages(self, client_id, project_id, session_id):
+    def delete_session_messages(self, client_id=None, project_id=None, session_id=None, user_id=None):
         pass
 
     @abstractmethod

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Configuration Manager for GraphRAG Pipeline
+Configuration Manager for VectorRAG Pipeline
 """
 
 import os
@@ -53,11 +53,6 @@ class ConfigManager:
         # Convert flat env config to nested structure
         self._config = {
             "database": {
-                "neo4j": {
-                    "uri": env_config.get("NEO4J_URI", "bolt://localhost:7687"),
-                    "username": env_config.get("NEO4J_USERNAME", "neo4j"),
-                    "password": env_config.get("NEO4J_PASSWORD", "password")
-                },
                 "chromadb": {
                     "host": env_config.get("CHROMADB_HOST", "localhost"),
                     "port": int(env_config.get("CHROMADB_PORT", "8001"))
@@ -76,11 +71,6 @@ class ConfigManager:
         """Get default configuration"""
         return {
             "database": {
-                "neo4j": {
-                    "uri": "bolt://localhost:7687",
-                    "username": "neo4j",
-                    "password": "password"
-                },
                 "chromadb": {
                     "host": "localhost",
                     "port": 8001
@@ -122,12 +112,6 @@ class ConfigManager:
                 "model": "text-embedding-ada-002",
                 "api_key": "your-api-key-here",
                 "dimensions": 1536
-            },
-            "graph_builder": {
-                "max_entities_per_chunk": 50,
-                "relationship_threshold": 0.7,
-                "entity_extraction_model": "gpt-4",
-                "relationship_extraction_model": "gpt-4"
             },
             "preprocessing": {
                 "chunk_size": 1000,
@@ -178,7 +162,7 @@ class ConfigManager:
         # Check database configuration
         if "database" in self._config:
             db_config = self._config["database"]
-            if "neo4j" not in db_config and "chromadb" not in db_config:
+            if "chromadb" not in db_config:
                 warnings.append("No database connections configured")
         
         return {
