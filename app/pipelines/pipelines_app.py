@@ -1249,7 +1249,9 @@ class SaveVectorLLMMessage(Save2ChatHistory):
 
     def get_content(self) -> str:
         return self.inputs.get("run_vector_rag")
-
+    
+    def get_references(self) -> str:
+        return self.inputs.get('GetVectorReference', []).get('references', '["EmPtY!!"]')
 
 class SearchRelevantChunks:
     """Search for relevant chunks using ChromaDB's built-in similarity search with custom embeddings"""
@@ -1398,7 +1400,7 @@ class GetVectorReference:
         Returns:
             Dict with status, references list, and metadata
             - status: "completed" or "failed"
-            - references: List[Dict[str, str]] of {chunk_id: filename} mappings
+            - references: List[Dict] items with keys: chunk_id, file_name, chunk_text
             - error: Error message if failed
         """
         try:
@@ -1427,6 +1429,7 @@ class GetVectorReference:
             for i, chunk in enumerate(relevant_chunks):
                 chunk_id = chunk.get('chunk_id') or chunk.get('metadata', {}).get('chunk_id')
                 metadata = chunk.get('metadata', {})
+                chunk_text = chunk.get('text', '')
                 
                 # Try to get file_name from metadata
                 file_name = (
@@ -1444,7 +1447,11 @@ class GetVectorReference:
                     # Extract just the filename if it's a path
                     import os
                     file_name = os.path.basename(file_name) if ('/' in file_name or '\\' in file_name) else file_name
-                    references.append({chunk_id: file_name})
+                    references.append({
+                        "chunk_id": chunk_id,
+                        "file_name": file_name,
+                        "chunk_text": chunk_text,
+                    })
                 elif chunk_id:
                     chunk_ids_without_metadata.append(chunk_id)
                 else:
@@ -1521,7 +1528,11 @@ class GetVectorReference:
                     chunk_id = doc.get('chunk_id')
                     file_name = doc.get('file_name')
                     if chunk_id and file_name:
-                        references.append({chunk_id: file_name})
+                        references.append({
+                            "chunk_id": chunk_id,
+                            "file_name": file_name,
+                            "chunk_text": "",
+                        })
                         logger.debug(f"Mapped chunk {chunk_id[:16]}... to {file_name}")
                 
                 logger.info(f"Added {len(es_results)} references from Elasticsearch")
@@ -1571,7 +1582,6 @@ class GetVectorReference:
                 "references": [],
                 "total_mapped": 0
             }
-
 
 class FetchChatHistory:
     """Fetch recent chat history for the current session"""

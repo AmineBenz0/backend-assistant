@@ -2,8 +2,8 @@ defaults: &defaults
   template_id: vector_inference
   prompt_config:
     source: langfuse
-    organization_name: dxc
-    project_name: d.pac
+    organization_name: ia-assistant
+    project_name: ia-assistant
   database: default
 
 task: vector_inference
@@ -98,6 +98,7 @@ steps:
   - step: save_vector_llm_message
     pipeline_key: save_vector_llm_message
     inputs: 
+      - GetVectorReference
       - run_vector_rag
       - client_id
       - project_id
